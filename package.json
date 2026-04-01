@@ -1,0 +1,13 @@
+{
+  "name": "larkcli2copilot",
+  "version": "1.0.0",
+  "description": "飞书消息 x Copilot ACP 自动回复桥接器",
+  "type": "module",
+  "scripts": {
+    "bridge": "node lark-acp-bridge.mjs",
+    "acp": "powershell -ExecutionPolicy Bypass -File start-copilot-acp.ps1"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^0.3.1"
+  }
+}
