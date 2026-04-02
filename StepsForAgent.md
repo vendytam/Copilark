@@ -31,7 +31,7 @@ copilot --version
 
 #第 6 步 - 安装 Copilark
 ```
-git clone https://github.com/YOUR_GITHUB_USERNAME/Copilark.git
+git clone https://github.com/vendytam/Copilark.git
 cd Copilark
 npm install
 bash install.sh
@@ -45,7 +45,7 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 参考项目内 `agents/dawbolong.agent.md` 模板（Copilark 根目录下），在 `~\.copilot\agents\` 中创建 `dawbolong.agent.md`。
 
 **步骤：**
-1. 打开 GitHub 仓库 https://github.com/YOUR_GITHUB_USERNAME/Copilark/blob/main/agents/dawbolong.agent.md
+1. 打开 GitHub 仓库 https://github.com/vendytam/Copilark/blob/main/agents/dawbolong.agent.md
 2. 复制全部内容
 3. 在本地创建 `~\.copilot\agents\dawbolong.agent.md` 并粘贴
 4. 编辑，将占位符替换为实际值：
