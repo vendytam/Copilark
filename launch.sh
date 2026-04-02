@@ -132,7 +132,7 @@ if [ -z "$BRIDGE_CWD" ]; then
   DEFAULT_CWD_UNIX="$(cygpath -u "$DEFAULT_CWD" 2>/dev/null || echo "$DEFAULT_CWD")"
   echo "  默认：$DEFAULT_CWD"
   echo ""
-  read -r -p "  输入工作目录（直接回车使用默认）: " input_cwd
+  read -e -r -p "  输入工作目录（直接回车使用默认）: " input_cwd
   if [ -n "$input_cwd" ]; then
     BRIDGE_CWD="$input_cwd"
   else
@@ -252,9 +252,21 @@ if [ "$WAITED" -ge 30 ]; then
   echo "  [!!] ACP Server 未在 30s 内响应，Bridge 会自动重试连接"
 fi
 BRIDGE_CWD_WIN="$(cygpath -w "$BRIDGE_CWD" 2>/dev/null || echo "$BRIDGE_CWD")"
+# 将选中的 agent.md 覆盖写入 cwd/AGENTS.md（Copilot 自动读取，保证每次启动都是最新身份）
+if [ -n "$SELECTED_AGENT" ] && [ "$SELECTED_AGENT" != "__none__" ]; then
+  AGENT_FILE_UNIX="$(cygpath -u "$USERPROFILE" 2>/dev/null || echo "$USERPROFILE")/.copilot/agents/${SELECTED_AGENT}.agent.md"
+  AGENT_MD_DEST="$BRIDGE_CWD/AGENTS.md"
+  if [ -f "$AGENT_FILE_UNIX" ]; then
+    mkdir -p "$BRIDGE_CWD"
+    cp "$AGENT_FILE_UNIX" "$AGENT_MD_DEST"
+    ok "AGENTS.md 已同步到 $AGENT_MD_DEST"
+  else
+    warn "Agent 文件不存在，跳过同步：$AGENT_FILE_UNIX"
+  fi
+fi
 BRIDGE_CMD="cd '$DIR' && BRIDGE_CWD='${BRIDGE_CWD_WIN}' node lark-acp-bridge.mjs"
 open_new_bash_window "Lark ACP Bridge" "$BRIDGE_CMD"
-ok "窗口 2 已打开 — Lark ACP Bridge  (cwd: $BRIDGE_CWD)"
+ok "窗口 2 已打开 — Lark ACP Bridge  (cwd: $BRIDGE_CWD, agent: ${SELECTED_AGENT:-无})"
 
 # ─── 完成 ─────────────────────────────────────────────────────────────────────
 echo ""

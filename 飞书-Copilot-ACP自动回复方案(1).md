@@ -66,7 +66,7 @@ copilot --acp --port 3000
 
 | 指令 | 说明 |
 |------|------|
-| `!status` | Bridge 回复最近 5 行日志（环形缓冲，保留最近 20 行） |
+| `!status` | Bridge 回复最近 10 行日志（post 格式，换行正常显示） |
 | `!stop` | 发送 ACP `session_cancel` 信令，立即打断当前 prompt 操作；session 保持，队列清空 |
 
 ---
@@ -111,9 +111,10 @@ Copilot CLI 会自动加载 `~/.copilot/agents/` 根目录下的所有 `.agent.m
 
 ```
 ~/.copilot/agents/
-├── dawbolong.agent.md        ← Copilot 加载（必须在根目录）
-└── dawbolong/
-    └── memory.md             ← 经验库（Agent 自动维护）
+└── dawbolong.agent.md        ← Copilot 加载（必须在根目录）+ 经验记录追加在末尾
+
+{cwd}/
+└── AGENTS.md                 ← 每次启动由 launch.sh 从 dawbolong.agent.md 覆盖同步（Copilot 自动读取）
 ```
 
 > ⚠️ Copilot CLI **不扫描子目录**，`.agent.md` 必须在根目录。
@@ -133,9 +134,13 @@ description: 大波龙 — vendy 的全能 AI 助手
 - **权限**：读写文件、执行命令、调用飞书（lark-im）、联网搜索
 - **飞书消息处理**：收到原始事件 JSON → 解析 content → 用 lark-im +messages-reply 回复，不只输出文字
 - **效率原则**：闲聊/问答类消息直接从已知信息回答，**禁止调用 shell**；只有用户明确要求执行操作才用工具，目标是最少工具调用数
-- **记忆机制**：解决非显而易见的问题后自动追加到 `~/.copilot/agents/dawbolong/memory.md`，遇到技术类问题先读取经验库参考
+- **记忆机制**：解决非显而易见的问题后自动追加到 `~/.copilot/agents/dawbolong.agent.md` 末尾，遇到技术类问题先读取文件末尾经验记录参考
 
-**修改方式：** 直接编辑 `~/.copilot/agents/dawbolong.agent.md`，重启 ACP Server 后生效。
+**修改方式：** 直接编辑 `~/.copilot/agents/dawbolong.agent.md`，重启后（新建会话）自动生效。
+
+**Agent 身份注入机制（AGENTS.md 同步）：**
+
+`launch.sh` 每次启动时，把选中的 `~/.copilot/agents/<agent>.agent.md` 内容覆盖写入 `{cwd}/AGENTS.md`。Copilot CLI 启动时自动读取工作目录下的 `AGENTS.md` 作为自定义指令，从而让 Agent 知道自己的身份和行为规范。经验记录追加到 agent.md 末尾，下次启动自动同步到 AGENTS.md。
 
 ---
 
@@ -159,6 +164,7 @@ bash launch.sh
 [ 工作目录 ]
   默认：D:\WorkSpaceClaw
   输入工作目录（直接回车使用默认）: _
+  （支持退格/方向键编辑；目录不存在时自动创建）
 
 [ 会话选择 ]
   上次会话 ID：b124c034...28c324c
@@ -167,7 +173,7 @@ bash launch.sh
   请输入编号 [1-2]:
 ```
 
-- **工作目录**：直接回车使用 agent 文件配置的默认目录，或输入自定义路径
+- **工作目录**：直接回车使用 agent 文件配置的默认目录，或输入自定义路径；支持退格/方向键；目录不存在时自动创建
 - 选 **1**：Bridge 用 `loadSession` 复用上次 session ID（对话历史延续）
 - 选 **2**：删除 `.acp-session-id`，创建全新会话
 - 首次启动（无历史）：跳过会话选择，直接创建新会话
@@ -220,7 +226,7 @@ node lark-acp-bridge.mjs
 - **Agent prompt 要点**：明确告知 Agent 用 lark-im 发回复（否则只输出文字）；闲聊类消息禁止调用 shell，避免响应变慢
 - **表情回应**：Agent 每次回复前必须先对原消息添加 emoji reaction，使用 `lark-cli im reactions create`，**根据消息内容选择合适表情**（确认→`OK`/`DONE`、提问→`THINKING`、报错→`SWEAT`、有趣→`LOL` 等），不要固定用 THUMBSUP
 - **消息格式**：含 JSON/代码片段的回复必须用 `--markdown` 参数；在 PowerShell `--text` 双引号字符串中使用 `\"` 会导致消息在 `{"` 处被截断；**`--markdown` 不支持 Markdown 表格**（会被丢弃），改用列表格式
-- **Agent 文件必须在根目录**：Copilot CLI 只扫描 `~/.copilot/agents/*.agent.md`，**不支持子目录**；子文件夹仅用于存放附属文件（如 memory.md）；`launch.sh` 已改为递归扫描以兼容未来可能的支持
+- **Agent 文件必须在根目录**：Copilot CLI 只扫描 `~/.copilot/agents/*.agent.md`，**不支持子目录**；经验记录追加到 agent.md 本身末尾，无需子文件夹；`launch.sh` 启动时自动同步最新内容到 `{cwd}/AGENTS.md`
 - **消息日志**：Bridge 收到消息时展示发送者ID后缀和消息预览（`ou:a951b → "你好"`），便于监控
 
 ---

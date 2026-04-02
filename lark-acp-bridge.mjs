@@ -15,10 +15,11 @@
  */
 
 import net from "node:net";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 
@@ -279,12 +280,24 @@ async function main() {
     const CMD_STOP   = "!stop";
 
     if (msgText === CMD_STATUS) {
-      const last5 = _logBuffer.slice(-5).join("\n");
-      const replyText = `📋 Bridge 最近日志：\n\`\`\`\n${last5}\n\`\`\``;
+      const lines = _logBuffer.slice(-10);
+      // 构造 post 格式 JSON，每行独立段落，避免 md tag 把 \n 渲染成字面量 <br>
+      const contentLines = [
+        [{ tag: "text", text: "📋 Bridge 最近日志：" }],
+        ...lines.map(l => [{ tag: "text", text: l }]),
+      ];
+      const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
+      const tmpFile = join(tmpdir(), `bridge-status-${Date.now()}.json`);
       try {
-        execSync(`lark-cli im +messages-reply --message-id ${event.message_id} --text ${JSON.stringify(replyText)}`, { shell: true });
+        writeFileSync(tmpFile, postJson, "utf8");
+        const tmpUnix = tmpFile.replace(/\\/g, "/").replace(/^([A-Za-z]):\//, (_, d) => `/${d.toLowerCase()}/`);
+        execSync(`lark-cli im +messages-reply --message-id ${event.message_id} --msg-type post --content "$(cat '${tmpUnix}')"`, { shell: "C:\\Program Files\\Git\\bin\\bash.exe" });
         log.info(`!status 已回复`);
-      } catch (e) { log.error(`!status 回复失败：${e.message}`); }
+      } catch (e) {
+        log.error(`!status 回复失败：${e.message}`);
+      } finally {
+        try { unlinkSync(tmpFile); } catch {}
+      }
       return;
     }
 
@@ -307,7 +320,7 @@ async function main() {
       const rawJson = JSON.stringify(event, null, 2);
       const reply = await sendToACP(connection, client, sessionId, rawJson);
       // reply 是 Copilot 的日志性文字（已通过 lark-im 回复飞书），仅记录不转发
-      if (reply) log.info(`Copilot 处理完成：${reply.slice(0, 120)}`);
+      if (reply) log.info(`Copilot 处理完成：${reply.slice(0, 300)}`);
     });
   });
 
