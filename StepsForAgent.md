@@ -54,24 +54,6 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 
 然后启动时 `launch.sh` 会自动同步到 `{cwd}/AGENTS.md`。
 
-<!-- ─── 经验记录（由 Agent 追加） ───────────────────────────────────────────── -->
-
-### [2026-03-31] --markdown 不支持 Markdown 表格
-**问题**：`--markdown` 将内容转为 post 格式的 `md` tag，飞书不渲染其中的 Markdown 表格，内容被丢弃只剩前后文字
-**方案**：消息中用有序/无序列表（`-` 或 `1.`）替代表格
-
-### [2026-03-31] PowerShell --text 中 \" 转义导致消息截断
-**问题**：`--text "...{\"key\":\"value\"}..."` 在 PowerShell 中 `\"` 不是合法转义，导致消息在 `{"` 处提前截断
-**方案**：回复含 JSON / 代码示例时改用 `--markdown` 参数；若必须用 `--text`，双引号用反引号转义
-
-### [2026-03-31] lark-cli +messages-reply 无 --at 参数
-**问题**：`lark-cli im +messages-reply` 没有 `--at` 参数，无法直接 @用户
-**方案**：在 `--text` 内容中使用 `<at user_id="open_id"></at>` 标签实现 @mention
-
-### [2026-04-01] Windows 高DPI屏幕截图
-**问题**：有屏幕缩放时用 `System.Windows.Forms.Screen` 截图不全（只截到逻辑分辨率）
-**方案**：用 Python + pywin32 + pillow，调用 `SetProcessDpiAwareness(2)` + `GetDeviceCaps` 获取物理分辨率，再用 BitBlt 截图
-
 #第 8 步 - 飞书群聊中添加Bot
 提醒用户打开：https://open.feishu.cn/app
 找到对应应用 → 机器人 → 将机器人添加至目标群聊。
