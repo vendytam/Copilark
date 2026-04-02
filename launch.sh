@@ -192,7 +192,7 @@ open_new_bash_window() {
 # ─── 环境检查 ──────────────────────────────────────────────────────────────────
 echo ""
 echo "========================================"
-echo "   LarkCli2Copilot  Launch (Git Bash)"
+echo "   Copilark  Launch (Git Bash)"
 echo "========================================"
 echo ""
 echo "[ 环境检查 ]"

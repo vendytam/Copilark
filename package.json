@@ -1,5 +1,5 @@
 {
-  "name": "larkcli2copilot",
+  "name": "copilark",
   "version": "1.0.0",
   "description": "飞书消息 x Copilot ACP 自动回复桥接器",
   "type": "module",

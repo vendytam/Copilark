@@ -1,4 +1,4 @@
-# LarkCli2Copilot
+# Copilark
 
 飞书群消息 × GitHub Copilot ACP 自动回复系统
 
@@ -23,6 +23,7 @@ lark-cli im +messages-reply  ← 发送回复到飞书
 | 文件 | 说明 |
 |------|------|
 | `launch.sh` | **一键启动**：启动时交互选择 Agent，弹出两个 Git Bash 窗口 |
+| `install.sh` | **全局命令安装**：生成 `~/bin/copilark`，之后任意目录可直接运行 `copilark` |
 | `start-copilot-acp.sh` | 单独启动 Copilot ACP Server（默认使用大波龙 Agent） |
 | `lark-acp-bridge.mjs` | 桥接器：订阅飞书事件 → 原始 JSON 转发给 Copilot ACP |
 
@@ -74,11 +75,17 @@ Agent 文件结构：
 
 ## 启动方式
 
-### 🚀 一键启动（推荐，Git Bash）
+### 🚀 一键启动（推荐，任意目录）
 
+安装全局命令（仅需一次）：
 ```bash
-cd /d/Workspace/LarkCli2Copilot
-bash launch.sh
+cd /d/Workspace/Copilark
+bash install.sh
+```
+
+之后任意目录直接运行：
+```bash
+copilark
 ```
 
 启动时会交互选择 Agent：
@@ -92,13 +99,13 @@ bash launch.sh
 
 其他参数：
 ```bash
-bash launch.sh --agent=dawbolong          # 跳过选择，直接指定
-bash launch.sh --cwd='D:\Workspace\MyProject'  # 跳过工作目录选择（路径含反斜杠需加引号）
-bash launch.sh --new                      # 强制创建全新会话（跳过会话选择）
-bash launch.sh --continue                 # 恢复上次对话（跳过会话选择）
-bash launch.sh --resume=<id>             # 恢复指定会话
-bash launch.sh --model=gpt-5.4           # 指定模型
-bash launch.sh --port=4000               # 自定义端口
+copilark --agent=dawbolong          # 跳过选择，直接指定
+copilark --cwd='D:\Workspace\MyProject'  # 跳过工作目录选择（路径含反斜杠需加引号）
+copilark --new                      # 强制创建全新会话（跳过会话选择）
+copilark --continue                 # 恢复上次对话（跳过会话选择）
+copilark --resume=<id>             # 恢复指定会话
+copilark --model=gpt-5.4           # 指定模型
+copilark --port=4000               # 自定义端口
 ```
 
 > ⚠️ **路径参数注意**：Windows 路径含反斜杠时需加引号，否则 bash 会吃掉反斜杠：
@@ -113,9 +120,9 @@ bash launch.sh --port=4000               # 自定义端口
 一键无交互启动示例：
 ```bash
 # 全新会话
-bash launch.sh --agent=dawbolong --cwd='D:\WorkSpaceClaw' --new
+copilark --agent=dawbolong --cwd='D:\WorkSpaceClaw' --new
 # 恢复上次会话
-bash launch.sh --agent=dawbolong --cwd='D:\WorkSpaceClaw' --continue
+copilark --agent=dawbolong --cwd='D:\WorkSpaceClaw' --continue
 ```
 
 看到 Bridge 窗口输出以下内容即就绪：
