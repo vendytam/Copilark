@@ -1,7 +1,16 @@
 快速开始（AI Agent）
 以下步骤面向 AI Agent，部分步骤需要用户在浏览器中配合完成。
 
-#第 1 步 — 安装
+## 前置条件
+- Windows 操作系统
+- Node.js v18+
+- Git Bash（Git for Windows 附带，用于执行脚本）
+- GitHub 账号（已登录 GitHub CLI）
+- 飞书应用凭证（App ID + App Secret）
+
+## 安装步骤
+
+#第 1 步 — 安装 Lark CLI
 安装 CLI
 npm install -g @larksuite/cli
 安装 CLI SKILL（必需）
@@ -18,7 +27,7 @@ lark-cli auth login --recommend
 #第 4 步 — 验证
 lark-cli auth status
 
-#第 5 步 - copilot cli安装
+#第 5 步 - 安装 Copilot CLI（GitHub 账号必需）
 在后台运行以下命令，完成后会要求在浏览器中登录 GitHub：
 ```
 npm install -g @github-copilot/cli
@@ -29,7 +38,7 @@ gh auth login
 copilot --version
 ```
 
-#第 6 步 - 安装 Copilark
+#第 6 步 - 克隆并安装 Copilark 项目
 ```
 git clone https://github.com/vendytam/Copilark.git
 cd Copilark
@@ -41,7 +50,7 @@ bash install.sh
 node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 ```
 
-#第 7 步 - 初始AGENT设置
+#第 7 步 - 初始化 Agent 配置
 参考项目内 `agents/dawbolong.agent.md` 模板（Copilark 根目录下），在 `~\.copilot\agents\` 中创建 `dawbolong.agent.md`。
 
 **步骤：**
@@ -54,11 +63,11 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 
 然后启动时 `launch.sh` 会自动同步到 `{cwd}/AGENTS.md`。
 
-#第 8 步 - 飞书群聊中添加Bot
+#第 8 步 - 将 Bot 添加到飞书群聊
 提醒用户打开：https://open.feishu.cn/app
 找到对应应用 → 机器人 → 将机器人添加至目标群聊。
 
-#第 9 步 - 飞书App事件与回调设置
+#第 9 步 - 配置飞书应用事件与权限
 提醒用户打开：https://open.feishu.cn/app
 找到事件与回调；
 事件只开启：
@@ -69,7 +78,7 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 	读取用户发给机器人的单聊消息
 只开启以上权限
 
-#第 10 步 - 开启Copilark
+#第 10 步 - 启动 Copilark
 在任意目录运行：
 ```
 copilark
