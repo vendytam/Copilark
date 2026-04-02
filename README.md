@@ -92,10 +92,7 @@ copilark
 ```
 [ 选择 Agent ]
   0) 不使用 Agent（默认 Copilot）
-  1) dawbolong            大波龙 — vendy 的全能 AI 助手...
-
-  请输入编号 [0-1]:
-```
+  1) dawbolong            大波龙 — 飞书自动回复 AI 助手...
 
 其他参数：
 ```bash
@@ -111,18 +108,18 @@ copilark --port=4000               # 自定义端口
 > ⚠️ **路径参数注意**：Windows 路径含反斜杠时需加引号，否则 bash 会吃掉反斜杠：
 > ```bash
 > # ✅ 正确
-> bash launch.sh --cwd='D:\WorkSpaceClaw' --continue
+> bash launch.sh --cwd='D:\your-workspace' --continue
 > # ❌ 错误（反斜杠被 bash 吃掉，loadSession 会失败）
-> bash launch.sh --cwd=D:\WorkSpaceClaw --continue
+> bash launch.sh --cwd=D:\your-workspace --continue
 > ```
-> launch.sh 内置了自动修复逻辑，会尝试还原 `D:WorkSpaceClaw` → `D:\WorkSpaceClaw`，但建议还是加引号。
+> launch.sh 内置了自动修复逻辑，会尝试还原 `D:your-workspace` → `D:\your-workspace`，但建议还是加引号。
 
 一键无交互启动示例：
 ```bash
 # 全新会话
-copilark --agent=dawbolong --cwd='D:\WorkSpaceClaw' --new
+copilark --agent=dawbolong --cwd='D:\your-workspace' --new
 # 恢复上次会话
-copilark --agent=dawbolong --cwd='D:\WorkSpaceClaw' --continue
+copilark --agent=dawbolong --cwd='D:\your-workspace' --continue
 ```
 
 看到 Bridge 窗口输出以下内容即就绪：
@@ -134,11 +131,11 @@ copilark --agent=dawbolong --cwd='D:\WorkSpaceClaw' --continue
 ```
 [ 选择 Agent ]
   0) 不使用 Agent（默认 Copilot）
-  1) dawbolong            大波龙 — vendy 的全能 AI 助手...
+  1) dawbolong            大波龙 — 飞书自动回复 AI 助手...
   请输入编号 [0-1]: 1
 
 [ 工作目录 ]
-  默认：D:\WorkSpaceClaw
+  默认：D:\your-workspace
   输入工作目录（直接回车使用默认）: _
   （支持退格/方向键编辑；目录不存在时自动创建）
 
