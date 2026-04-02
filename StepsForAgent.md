@@ -42,9 +42,15 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 ```
 
 #第 7 步 - 初始AGENT设置
-参考 `agents/dawbolong.agent.md` 模板，在 `~\.copilot\agents\` 中创建 `dawbolong.agent.md`，将模板内容复制过去后，将占位符替换为实际值：
-- `YOUR_NAME` → 你的名字
-- `YOUR_CWD` → 默认工作目录路径
+参考项目内 `agents/dawbolong.agent.md` 模板（Copilark 根目录下），在 `~\.copilot\agents\` 中创建 `dawbolong.agent.md`。
+
+**步骤：**
+1. 打开 GitHub 仓库 https://github.com/YOUR_GITHUB_USERNAME/Copilark/blob/main/agents/dawbolong.agent.md
+2. 复制全部内容
+3. 在本地创建 `~\.copilot\agents\dawbolong.agent.md` 并粘贴
+4. 编辑，将占位符替换为实际值：
+   - `YOUR_NAME` → 你的名字
+   - `YOUR_CWD` → 默认工作目录路径
 
 然后启动时 `launch.sh` 会自动同步到 `{cwd}/AGENTS.md`。
 
