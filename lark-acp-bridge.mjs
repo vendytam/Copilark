@@ -35,10 +35,12 @@ const CONFIG = {
   // SysBuilder 后端集成（报告分析功能）
   backendUrl:      process.env.SYSBUILDER_BACKEND_URL || "http://47.79.4.19",
   backendToken:    process.env.SYSBUILDER_TOKEN       || "",
+  backendCookie:   process.env.SYSBUILDER_COOKIE      || "",
   pollIntervalMs:  Number(process.env.POLL_INTERVAL_MS || 20000),
 };
 
-const SESSION_FILE = join(import.meta.dirname, ".acp-session-id");
+const SESSION_FILE    = join(import.meta.dirname, ".acp-session-id");
+const BRIDGE_AUTH_FILE = join(homedir(), ".copilark", "bridge-auth.txt");
 
 // ─── ACP Client ───────────────────────────────────────────────────────────────
 
@@ -73,9 +75,18 @@ function backendRequest(method, urlPath, body) {
     const full = new URL(CONFIG.backendUrl + urlPath);
     const mod  = full.protocol === "https:" ? https : http;
     const data = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
+
+    // 认证优先级：Bearer token > Cookie（均可从 .env.local 配置）
+    let authHeader = {};
+    if (CONFIG.backendToken) {
+      authHeader = { Authorization: `Bearer ${CONFIG.backendToken}` };
+    } else if (CONFIG.backendCookie) {
+      authHeader = { Cookie: CONFIG.backendCookie };
+    }
+
     const headers = {
       "Content-Type": "application/json",
-      ...(CONFIG.backendToken ? { Authorization: `Bearer ${CONFIG.backendToken}` } : {}),
+      ...authHeader,
       ...(data ? { "Content-Length": data.length } : {}),
     };
     const req = mod.request(
@@ -280,8 +291,8 @@ let _analysisRunning = false;
 
 async function pollAndProcessReports() {
   if (_analysisRunning) return;
-  if (!CONFIG.backendToken) {
-    // 未配置 SYSBUILDER_TOKEN，无法认证，静默跳过
+  if (!CONFIG.backendToken && !CONFIG.backendCookie) {
+    // 未配置任何认证凭据，静默跳过
     return;
   }
 
