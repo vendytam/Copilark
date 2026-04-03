@@ -15,6 +15,8 @@
  */
 
 import net from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { execSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
@@ -30,6 +32,10 @@ const CONFIG = {
   acpPort:  Number(process.env.ACP_PORT  || 3000),
   maxRetries: 3,
   cwd: process.env.BRIDGE_CWD || process.cwd(),
+  // SysBuilder 后端集成（报告分析功能）
+  backendUrl:      process.env.SYSBUILDER_BACKEND_URL || "http://47.79.4.19",
+  backendToken:    process.env.SYSBUILDER_TOKEN       || "",
+  pollIntervalMs:  Number(process.env.POLL_INTERVAL_MS || 20000),
 };
 
 const SESSION_FILE = join(import.meta.dirname, ".acp-session-id");
@@ -55,6 +61,56 @@ const log = {
   error: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][ERROR] ${a.join(" ")}`; bufferLog(l); console.error(l); },
   event: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][EVENT] ${a.join(" ")}`; bufferLog(l); console.log(l); },
 };
+
+// ─── lastChatId（报告完成通知目标群）─────────────────────────────────────────
+
+let lastChatId = null; // 每次收到飞书事件时更新，用于主动推送 Lark 通知
+
+// ─── 后端 HTTP 工具 ───────────────────────────────────────────────────────────
+
+function backendRequest(method, urlPath, body) {
+  return new Promise((resolve, reject) => {
+    const full = new URL(CONFIG.backendUrl + urlPath);
+    const mod  = full.protocol === "https:" ? https : http;
+    const data = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
+    const headers = {
+      "Content-Type": "application/json",
+      ...(CONFIG.backendToken ? { Authorization: `Bearer ${CONFIG.backendToken}` } : {}),
+      ...(data ? { "Content-Length": data.length } : {}),
+    };
+    const req = mod.request(
+      { hostname: full.hostname, port: full.port || (full.protocol === "https:" ? 443 : 80),
+        path: full.pathname + full.search, method, headers },
+      (res) => {
+        let raw = "";
+        res.on("data", (c) => { raw += c; });
+        res.on("end", () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(raw) }); }
+          catch { resolve({ status: res.statusCode, body: raw }); }
+        });
+      }
+    );
+    req.on("error", reject);
+    if (data) req.write(data);
+    req.end();
+  });
+}
+
+// ─── 飞书群主动通知 ───────────────────────────────────────────────────────────
+
+function notifyLark(text) {
+  if (!lastChatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
+  const safeText = text.replace(/"/g, '\\"').replace(/\n/g, " ");
+  try {
+    execSync(
+      `lark-cli im +messages-send --chat-id ${lastChatId} --text "${safeText}"`,
+      { shell: process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : true }
+    );
+    log.info(`Lark 通知已发送到 ${lastChatId}：${text.slice(0, 80)}`);
+  } catch (e) {
+    log.error(`Lark 通知失败：${e.message}`);
+  }
+}
 
 // ─── ACP 连接 & 会话 ──────────────────────────────────────────────────────────
 
@@ -175,6 +231,119 @@ class MessageCollector {
   getText() { return this._parts.join("").trim(); }
 }
 
+// ─── 分析任务：临时 ACP Session B ────────────────────────────────────────────
+
+async function runAnalysisSession(localPath) {
+  log.info(`创建分析 Session B（cwd: ${localPath}）...`);
+  let conn2, client2;
+  for (let i = 1; i <= CONFIG.maxRetries; i++) {
+    try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+    catch (err) {
+      if (i === CONFIG.maxRetries) throw new Error(`Session B 连接失败：${err.message}`);
+      await sleep(2000);
+    }
+  }
+
+  const { sessionId: sid2 } = await conn2.newSession({ cwd: localPath, mcpServers: [] });
+  log.info(`分析 Session B 已创建：${sid2}`);
+
+  // 构造 CARPM 分析提示词（Copilot 已知 carpm-analyzer skill，无需传路径）
+  const prompt =
+    `请调用 carpm-analyzer 对当前项目进行分析，` +
+    `将报告保存至 docs/carpm-output/carpm-report.md，` +
+    `将 JSON 基线保存至 docs/carpm-output/carpm-baseline.json，` +
+    `全部完成后回复"CARPM 分析完成"。`;
+
+  try {
+    await sendToACP(conn2, client2, sid2, prompt);
+  } finally {
+    try { await conn2.closeSession({ sessionId: sid2 }); } catch {}
+    log.info(`分析 Session B 已关闭：${sid2}`);
+  }
+
+  // 读取分析输出文件（Agent 已写入项目目录）
+  const reportPath   = join(localPath, "docs", "carpm-output", "carpm-report.md");
+  const baselinePath = join(localPath, "docs", "carpm-output", "carpm-baseline.json");
+
+  const markdown    = existsSync(reportPath)   ? readFileSync(reportPath,   "utf8") : null;
+  const baselineJson = existsSync(baselinePath) ? readFileSync(baselinePath, "utf8") : null;
+
+  if (!markdown) throw new Error(`报告文件未生成：${reportPath}`);
+  log.info(`报告文件已读取（${Math.round(markdown.length / 1024)}KB）`);
+
+  return { markdown, baselineJson };
+}
+
+// ─── 报告轮询 & 处理 ──────────────────────────────────────────────────────────
+
+let _analysisRunning = false;
+
+async function pollAndProcessReports() {
+  if (_analysisRunning) return;
+  if (!CONFIG.backendToken) {
+    // 未配置 SYSBUILDER_TOKEN，无法认证，静默跳过
+    return;
+  }
+
+  let pending;
+  try {
+    const res = await backendRequest("GET", "/api/reports/pending");
+    if (res.status !== 200) return; // 未登录或服务不可达，静默跳过
+    pending = Array.isArray(res.body) ? res.body : [];
+  } catch { return; } // 后端不可达，静默跳过
+
+  if (!pending.length) return;
+
+  const { reportId, projectId, title, requestContext } = pending[0];
+  let ctx = {};
+  try { ctx = JSON.parse(requestContext || "{}"); } catch {}
+  const localPath = ctx.localPath;
+
+  if (!localPath) {
+    log.warn(`报告 ${reportId} 无 localPath，跳过`);
+    return;
+  }
+
+  _analysisRunning = true;
+  const projectName = localPath.split(/[\\/]/).pop();
+  log.info(`🔍 开始处理报告：${title || reportId}（${projectName}）`);
+  notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`);
+
+  try {
+    // 标记为 RUNNING
+    await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`,
+      { status: "RUNNING" });
+
+    let markdown = "", baselineJson = null;
+    let status = "COMPLETED";
+    try {
+      ({ markdown, baselineJson } = await runAnalysisSession(localPath));
+    } catch (err) {
+      log.error(`分析失败：${err.message}`);
+      status = "FAILED";
+      markdown = `## 分析失败\n\n${err.message}`;
+    }
+
+    const submitBody = { reportMarkdown: markdown, status };
+    if (baselineJson) submitBody.baselineJson = baselineJson;
+    await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`, submitBody);
+
+    const ok = status === "COMPLETED";
+    log.info(`报告 ${reportId} 处理完成，状态：${status}`);
+    notifyLark(ok
+      ? `✅ 项目 ${projectName} 分析完成，报告已上传，请前往 SysBuilder 查看`
+      : `❌ 项目 ${projectName} 分析失败，请检查日志`);
+  } catch (err) {
+    log.error(`报告处理出错：${err.message}`);
+    try {
+      await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`,
+        { status: "FAILED", reportMarkdown: `## 处理出错\n\n${err.message}` });
+    } catch {}
+  } finally {
+    _analysisRunning = false;
+  }
+}
+
 // ─── 飞书事件订阅 ──────────────────────────────────────────────────────────────
 
 function subscribeLarkEvents(onEvent) {
@@ -275,6 +444,9 @@ async function main() {
 
     log.event(`收到消息 [${event.chat_type}] ${sender} → "${preview}"`);
 
+    // 追踪最近活跃的群聊 ID，用于主动推送通知
+    if (event.chat_id) lastChatId = event.chat_id;
+
     // ── 特殊控制指令（不转发给 ACP）──────────────────────────────────────────
     const CMD_STATUS = "!status";
     const CMD_STOP   = "!stop";
@@ -325,6 +497,14 @@ async function main() {
   });
 
   log.info("[Bridge] Ready. 正在监听飞书消息...");
+
+  // 启动报告轮询（每隔 pollIntervalMs 检查一次待处理分析任务）
+  if (CONFIG.backendUrl) {
+    log.info(`[Bridge] 报告轮询已启动（间隔 ${CONFIG.pollIntervalMs / 1000}s，后端：${CONFIG.backendUrl}）`);
+    setInterval(pollAndProcessReports, CONFIG.pollIntervalMs);
+    // 启动后稍等再首次轮询（等 ACP session 稳定）
+    setTimeout(pollAndProcessReports, 5000);
+  }
 }
 
 main().catch((err) => { log.error("致命错误：", err?.message || err?.stack || JSON.stringify(err)); process.exit(1); });
