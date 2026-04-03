@@ -21,7 +21,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 
@@ -35,7 +35,6 @@ const CONFIG = {
   // SysBuilder 后端集成（报告分析功能）
   backendUrl:      process.env.SYSBUILDER_BACKEND_URL || "http://47.79.4.19",
   backendToken:    process.env.SYSBUILDER_TOKEN       || "",
-  backendCookie:   process.env.SYSBUILDER_COOKIE      || "",
   pollIntervalMs:  Number(process.env.POLL_INTERVAL_MS || 20000),
 };
 
@@ -76,12 +75,17 @@ function backendRequest(method, urlPath, body) {
     const mod  = full.protocol === "https:" ? https : http;
     const data = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
 
-    // 认证优先级：Bearer token > Cookie（均可从 .env.local 配置）
+    // 认证优先级：Bearer token（.env.local）> 自动共享的 Electron session cookie
     let authHeader = {};
     if (CONFIG.backendToken) {
       authHeader = { Authorization: `Bearer ${CONFIG.backendToken}` };
-    } else if (CONFIG.backendCookie) {
-      authHeader = { Cookie: CONFIG.backendCookie };
+    } else {
+      try {
+        if (existsSync(BRIDGE_AUTH_FILE)) {
+          const cookie = readFileSync(BRIDGE_AUTH_FILE, "utf8").trim();
+          if (cookie) authHeader = { Cookie: cookie };
+        }
+      } catch {}
     }
 
     const headers = {
@@ -291,8 +295,8 @@ let _analysisRunning = false;
 
 async function pollAndProcessReports() {
   if (_analysisRunning) return;
-  if (!CONFIG.backendToken && !CONFIG.backendCookie) {
-    // 未配置任何认证凭据，静默跳过
+  if (!CONFIG.backendToken && !existsSync(BRIDGE_AUTH_FILE)) {
+    // 未配置 token 且 Electron 尚未登录（无共享 cookie 文件），静默跳过
     return;
   }
 
