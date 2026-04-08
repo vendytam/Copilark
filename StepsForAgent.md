@@ -76,6 +76,7 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 权限：
 	接收群聊中@机器人消息事件 
 	读取用户发给机器人的单聊消息
+	获取群组中所有消息（敏感权限）
 只开启以上权限
 
 #第 10 步 - 启动 Copilark
