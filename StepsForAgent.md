@@ -1,6 +1,8 @@
 快速开始（AI Agent）
 以下步骤面向 AI Agent，部分步骤需要用户在浏览器中配合完成。
 
+适用范围：本文档只用于独立安装并启动 Copilark，不包含 SysBuilder / Electron 集成步骤。
+
 ## 前置条件
 - Windows 操作系统
 - Node.js v18+
@@ -40,7 +42,7 @@ copilot --version
 
 #第 6 步 - 克隆并安装 Copilark 项目
 ```
-git clone https://github.com/vendytam/Copilark.git
+git clone -b feature/sysbuilder-analysis --single-branch https://github.com/vendytam/Copilark.git
 cd Copilark
 npm install
 bash install.sh
@@ -54,7 +56,7 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 参考项目内 `agents/dawbolong.agent.md` 模板（Copilark 根目录下），在 `~\.copilot\agents\` 中创建 `dawbolong.agent.md`。
 
 **步骤：**
-1. 打开 GitHub 仓库 https://github.com/vendytam/Copilark/blob/main/agents/dawbolong.agent.md
+1. 打开 GitHub 仓库 https://github.com/vendytam/Copilark/blob/feature/sysbuilder-analysis/agents/dawbolong.agent.md
 2. 复制全部内容
 3. 在本地创建 `~\.copilot\agents\dawbolong.agent.md` 并粘贴
 4. 编辑，将占位符替换为实际值：
@@ -89,4 +91,4 @@ copilark
 2. 询问工作目录（直接回车使用默认，或输入路径；目录不存在会自动创建）
 3. 自动打开两个窗口：Copilot ACP Server + Lark Bridge
 
-启动成功后，在飞书群 @机器人 发一条消息测试即可,或者私聊Bot。
+启动成功后，先在目标飞书群里 @机器人 发一条消息，或者先私聊 Bot 一条消息，确认 Bridge 已记录当前可用 chat_id 后再继续使用。
