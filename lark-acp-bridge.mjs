@@ -17,9 +17,9 @@
 import net from "node:net";
 import http from "node:http";
 import https from "node:https";
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, execFileSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { Writable, Readable } from "node:stream";
@@ -32,6 +32,8 @@ const CONFIG = {
   acpPort:  Number(process.env.ACP_PORT  || 3000),
   maxRetries: 3,
   cwd: process.env.BRIDGE_CWD || process.cwd(),
+  bridgeHttpPort: Number(process.env.BRIDGE_HTTP_PORT || 3001),
+  defaultChatId: process.env.LARK_CHAT_ID || "",
   // SysBuilder 后端集成（报告分析功能）
   backendUrl:      process.env.SYSBUILDER_BACKEND_URL || "http://47.79.4.19",
   backendToken:    process.env.SYSBUILDER_TOKEN       || "",
@@ -40,6 +42,177 @@ const CONFIG = {
 
 const SESSION_FILE    = join(import.meta.dirname, ".acp-session-id");
 const BRIDGE_AUTH_FILE = join(homedir(), ".copilark", "bridge-auth.txt");
+const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
+const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
+
+function resolveCommandPath(command) {
+  const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
+  const matches = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const extraCandidates = command === "lark-cli" && process.platform === "win32"
+    ? [join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")]
+    : [];
+  const candidates = [...matches, ...extraCandidates].filter(Boolean);
+  const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
+    ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
+    ?? matches[0];
+  if (!resolved) throw new Error(`无法定位命令：${command}`);
+  return resolved;
+}
+
+const LARK_CLI_PATH = process.platform === "win32" ? resolveCommandPath("lark-cli") : "lark-cli";
+
+function execLarkCli(args) {
+  return execFileSync(LARK_CLI_PATH, args.map((arg) => String(arg)), {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizeStringRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.entries(value).reduce((acc, [key, entry]) => {
+    if (typeof entry === "string" && key.trim()) acc[key.trim()] = entry;
+    return acc;
+  }, {});
+}
+
+function normalizeHttpHeaders(value) {
+  if (Array.isArray(value)) {
+    return value.reduce((acc, item) => {
+      if (item && typeof item === "object" && typeof item.name === "string" && typeof item.value === "string" && item.name.trim()) {
+        acc[item.name.trim()] = item.value;
+      }
+      return acc;
+    }, {});
+  }
+  if (!value || typeof value !== "object") return {};
+  return Object.entries(value).reduce((acc, [key, entry]) => {
+    if (typeof entry === "string" && key.trim()) acc[key.trim()] = entry;
+    return acc;
+  }, {});
+}
+
+function parseJsonObject(raw, fallback = {}) {
+  if (typeof raw !== "string" || !raw.trim()) return fallback;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function parseRemoteMcpFromEnv() {
+  const url = typeof process.env.SYSBUILDER_MCP_URL === "string" ? process.env.SYSBUILDER_MCP_URL.trim() : "";
+  if (!url) return null;
+  const rawTransport = typeof process.env.SYSBUILDER_MCP_TRANSPORT === "string"
+    ? process.env.SYSBUILDER_MCP_TRANSPORT.trim().toLowerCase()
+    : "http";
+  const transport = rawTransport === "sse" ? "sse" : "http";
+  const headers = normalizeHttpHeaders(readJsonFile(process.env.SYSBUILDER_MCP_HEADERS_FILE || "", {}));
+  const inlineHeaders = normalizeHttpHeaders(parseJsonObject(process.env.SYSBUILDER_MCP_HEADERS_JSON, {}));
+  return {
+    type: transport,
+    name: "sysbuilder",
+    url,
+    headers: { ...headers, ...inlineHeaders },
+  };
+}
+
+function parseStdioMcpFromEnv() {
+  const command = typeof process.env.SYSBUILDER_MCP_COMMAND === "string" ? process.env.SYSBUILDER_MCP_COMMAND.trim() : "";
+  if (!command) return null;
+  const args = normalizeStringArray(parseJsonObject(process.env.SYSBUILDER_MCP_ARGS_JSON || "[]", []));
+  const env = normalizeStringRecord(parseJsonObject(process.env.SYSBUILDER_MCP_ENV_JSON || "{}"));
+  if (!env.SYSBUILDER_URL) env.SYSBUILDER_URL = CONFIG.backendUrl;
+  if (!env.SYSBUILDER_TOKEN && CONFIG.backendToken) env.SYSBUILDER_TOKEN = CONFIG.backendToken;
+  return {
+    type: "stdio",
+    name: "sysbuilder",
+    command,
+    args,
+    env,
+  };
+}
+
+function loadConfiguredSysbuilderMcpServer() {
+  const fromEnv = parseRemoteMcpFromEnv();
+  if (fromEnv) return fromEnv;
+  const stdioFromEnv = parseStdioMcpFromEnv();
+  if (stdioFromEnv) return stdioFromEnv;
+
+  const parsed = readJsonFile(COPILOT_MCP_CONFIG_FILE, {});
+  const rawServers = parsed?.mcpServers && typeof parsed.mcpServers === "object" && !Array.isArray(parsed.mcpServers)
+    ? parsed.mcpServers
+    : parsed;
+  const entry = rawServers?.sysbuilder;
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+
+  const name = typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : "sysbuilder";
+  const url = typeof entry.url === "string" ? entry.url.trim() : "";
+  const transport = typeof entry.type === "string" && entry.type.trim().toLowerCase() === "sse" ? "sse" : "http";
+  if (url) {
+    return {
+      type: transport,
+      name,
+      url,
+      headers: normalizeHttpHeaders(entry.headers),
+    };
+  }
+
+  const command = typeof entry.command === "string" ? entry.command.trim() : "";
+  if (!command) return null;
+  const env = normalizeStringRecord(entry.env);
+  if (!env.SYSBUILDER_URL) env.SYSBUILDER_URL = CONFIG.backendUrl;
+  if (!env.SYSBUILDER_TOKEN && CONFIG.backendToken) env.SYSBUILDER_TOKEN = CONFIG.backendToken;
+  return {
+    type: "stdio",
+    name,
+    command,
+    args: normalizeStringArray(entry.args),
+    env,
+  };
+}
+
+function requireConfiguredSysbuilderMcpServer() {
+  const server = loadConfiguredSysbuilderMcpServer();
+  if (!server) {
+    throw new Error("未配置可用的 sysbuilder MCP。请先在全局 MCP 配置中配置 sysbuilder（stdio 或 HTTP/SSE），再启动 Story Map 同步。");
+  }
+  return server;
+}
+
+function buildAcpMcpServer(server) {
+  if (server.type === "http" || server.type === "sse") {
+    return {
+      type: server.type,
+      name: server.name,
+      url: server.url,
+      headers: Object.entries(server.headers || {}).map(([name, value]) => ({ name, value })),
+    };
+  }
+  return {
+    name: server.name,
+    command: server.command,
+    args: server.args,
+    env: Object.entries(server.env).map(([name, value]) => ({ name, value })),
+  };
+}
 
 // ─── ACP Client ───────────────────────────────────────────────────────────────
 
@@ -65,7 +238,27 @@ const log = {
 
 // ─── lastChatId（报告完成通知目标群）─────────────────────────────────────────
 
-let lastChatId = null; // 每次收到飞书事件时更新，用于主动推送 Lark 通知
+let lastChatId = CONFIG.defaultChatId || null; // 每次收到飞书事件时更新，用于主动推送 Lark 通知
+const analysisJobs = new Map();
+const waitingTickets = new Map();
+let questionSeq = 0;
+let bridgeHttpServer = null;
+
+try {
+  if (!lastChatId && existsSync(LAST_CHAT_ID_FILE)) {
+    const savedChatId = readFileSync(LAST_CHAT_ID_FILE, "utf8").trim();
+    if (savedChatId) lastChatId = savedChatId;
+  }
+} catch {}
+
+function persistLastChatId(chatId) {
+  if (!chatId) return;
+  try {
+    writeFileSync(LAST_CHAT_ID_FILE, chatId, "utf8");
+  } catch (err) {
+    log.warn(`persistLastChatId 失败：${err?.message || String(err)}`);
+  }
+}
 
 // ─── 后端 HTTP 工具 ───────────────────────────────────────────────────────────
 
@@ -115,15 +308,20 @@ function backendRequest(method, urlPath, body) {
 
 function notifyLark(text) {
   if (!lastChatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
-  const safeText = text.replace(/"/g, '\\"').replace(/\n/g, " ");
+  const lines = text.split(/\r?\n/).filter((line) => line.length > 0);
+  const contentLines = lines.length > 0
+    ? lines.map((line) => [{ tag: "text", text: line }])
+    : [[{ tag: "text", text }]];
+  const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
+  const tmpFile = join(tmpdir(), `bridge-notify-${Date.now()}.json`);
   try {
-    execSync(
-      `lark-cli im +messages-send --chat-id ${lastChatId} --text "${safeText}"`,
-      { shell: process.platform === "win32" ? "C:\\Program Files\\Git\\bin\\bash.exe" : true }
-    );
+    writeFileSync(tmpFile, postJson, "utf8");
+    execLarkCli(["im", "+messages-send", "--chat-id", lastChatId, "--msg-type", "post", "--content", postJson]);
     log.info(`Lark 通知已发送到 ${lastChatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
+  } finally {
+    try { unlinkSync(tmpFile); } catch {}
   }
 }
 
@@ -183,17 +381,32 @@ async function ensureSession(connection) {
   return acpSessionId;
 }
 
-async function sendToACP(connection, client, sessionId, text) {
-  const collector = new MessageCollector();
+async function sendToACP(connection, client, sessionId, text, onChunk) {
+  let cancelRequestedForUserInput = false;
+  const collector = new MessageCollector({
+    onChunk,
+    onNeedUserInput: async () => {
+      if (cancelRequestedForUserInput) return;
+      cancelRequestedForUserInput = true;
+      log.info("检测到 NEED_USER_INPUT，暂停当前 Session B 轮次，等待用户答复...");
+      try { await connection.cancel({ sessionId }); } catch {}
+    },
+  });
   client._activeCollector = collector;
-  await connection.prompt({ sessionId, prompt: [{ type: "text", text }] });
+  try {
+    await connection.prompt({ sessionId, prompt: [{ type: "text", text }] });
+  } catch (err) {
+    if (!cancelRequestedForUserInput) throw err;
+  } finally {
+    if (client._activeCollector === collector) client._activeCollector = null;
+  }
   return collector.getText();
 }
 
 // ─── ACP Client ───────────────────────────────────────────────────────────────
 
 class BridgeAcpClient {
-  constructor() { this._activeCollector = null; }
+  constructor() { this._activeCollector = null; this._toolTitles = new Map(); }
 
   async requestPermission(params) {
     const first = params.options[0];
@@ -217,10 +430,18 @@ class BridgeAcpClient {
       case "tool_call":
         log.info(`  🔧 [${u.status}] ${u.title}`);
         if (u.input) log.info(`      输入: ${JSON.stringify(u.input).slice(0, 200)}`);
+        if (u.toolCallId && u.title) this._toolTitles.set(u.toolCallId, u.title);
+        if (this._activeCollector) this._activeCollector.pushLive(`\n[工具] ${u.title}\n`);
         break;
       case "tool_call_update":
-        log.info(`  ✅ [${u.status}] ${u.toolCallId}`);
+        log.info(`  ✅ [${u.status}] ${this._toolTitles.get(u.toolCallId) || u.toolCallId}`);
         if (u.output) log.info(`      输出: ${String(u.output).slice(0, 200)}`);
+        if (this._activeCollector) {
+          const output = u.output ? `：${String(u.output).slice(0, 120)}` : "";
+          const title = this._toolTitles.get(u.toolCallId) || u.toolCallId;
+          this._activeCollector.pushLive(`\n[完成] ${title}${output}\n`);
+        }
+        if (u.toolCallId && u.status !== "pending" && u.status !== "in_progress") this._toolTitles.delete(u.toolCallId);
         break;
       case "agent_thought_chunk":
         if (u.content?.type === "text") {
@@ -230,6 +451,7 @@ class BridgeAcpClient {
         break;
       case "plan":
         log.info(`  📋 计划: ${JSON.stringify(u).slice(0, 200)}`);
+        if (this._activeCollector) this._activeCollector.pushLive("\n[计划] 已更新执行计划\n");
         break;
       default:
         break;
@@ -241,9 +463,866 @@ class BridgeAcpClient {
 }
 
 class MessageCollector {
-  constructor() { this._parts = []; }
-  push(text) { this._parts.push(text); }
+  constructor(options = {}) {
+    this._parts = [];
+    this._onChunk = options.onChunk || null;
+    this._onNeedUserInput = options.onNeedUserInput || null;
+    this._needUserInputTriggered = false;
+  }
+  push(text) {
+    this._parts.push(text);
+    if (this._onChunk) this._onChunk(text);
+    if (!this._needUserInputTriggered && this._onNeedUserInput && parseNeedUserInput(this.getText())) {
+      this._needUserInputTriggered = true;
+      void this._onNeedUserInput();
+    }
+  }
+  pushLive(text) {
+    if (this._onChunk) this._onChunk(text);
+  }
   getText() { return this._parts.join("").trim(); }
+}
+
+function parseNeedUserInput(text) {
+  const match = text.match(/<<<NEED_USER_INPUT>>>([\s\S]*?)<<<END_NEED_USER_INPUT>>>/);
+  if (!match) return null;
+
+  const block = match[1].trim();
+  const lines = block.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const parsed = { question: "", context: "", kind: "", options: [] };
+  let collectingOptions = false;
+
+  for (const line of lines) {
+    if (line.startsWith("question:")) {
+      parsed.question = line.slice("question:".length).trim();
+      collectingOptions = false;
+    } else if (line.startsWith("context:")) {
+      parsed.context = line.slice("context:".length).trim();
+      collectingOptions = false;
+    } else if (line.startsWith("kind:")) {
+      parsed.kind = line.slice("kind:".length).trim();
+      collectingOptions = false;
+    } else if (line.startsWith("suggested_options:")) {
+      collectingOptions = true;
+    } else if (collectingOptions && line.startsWith("-")) {
+      parsed.options.push(line.slice(1).trim());
+    }
+  }
+
+  return parsed.question ? parsed : null;
+}
+
+function nextTicketId() {
+  questionSeq += 1;
+  return `Q-${new Date().toISOString().slice(0, 10).replace(/-/g, "")}-${String(questionSeq).padStart(3, "0")}`;
+}
+
+function sendQuestionToLark(ticket) {
+  if (!lastChatId) {
+    throw new Error("当前没有可用的飞书 chat_id，请先在群里和 Bot 说一句话");
+  }
+
+  const lines = [
+    `[${ticket.ticketId}] 任务执行过程中需要你确认：`,
+    ticket.questionText,
+    ticket.context ? "" : null,
+    ticket.context ? `背景：${ticket.context}` : null,
+    "",
+    `请直接回复并带上 [${ticket.ticketId}]，或直接回复本条消息。`,
+    "注意：此时你的回复内容会被当作该问题的答案继续送回分析流程，请尽量直接回答，不要闲聊。",
+    ...(ticket.options.length ? ["可选：", ...ticket.options.map((opt, i) => `${i + 1}. ${opt}`)] : []),
+  ].filter(Boolean);
+  notifyLark(lines.join("\n"));
+}
+
+function updateJob(jobId, patch) {
+  const prev = analysisJobs.get(jobId);
+  if (!prev) return;
+  analysisJobs.set(jobId, { ...prev, ...patch, updatedAt: new Date().toISOString() });
+}
+
+function appendJobLiveLog(jobId, chunk) {
+  const prev = analysisJobs.get(jobId);
+  if (!prev || !chunk) return;
+  const nextLog = ((prev.liveLog || "") + chunk).slice(-16000);
+  analysisJobs.set(jobId, { ...prev, liveLog: nextLog, updatedAt: new Date().toISOString() });
+}
+
+function isJobStopRequested(jobId) {
+  return Boolean(analysisJobs.get(jobId)?.stopRequested);
+}
+
+function detectUnresolvedConfirmations(text) {
+  if (!text) return null;
+  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const matched = lines.filter((line) => (
+    /仍待确认|待确认事项|剩余\d+个问题|未确认|需与.+确认|需要与.+确认|后续确认/.test(line)
+  ));
+  if (!matched.length) return null;
+  return matched.slice(0, 3).join("；");
+}
+
+function detectFatalExecutionError(text) {
+  if (!text) return null;
+  const match = text.match(/Error:\s*Execution failed:[\s\S]*?(?=Error:\s*Execution failed:|$)/);
+  return match ? match[0].trim() : null;
+}
+
+function ensureRefactorOutputs(projectPath) {
+  const refactorDir = join(projectPath, "docs", "refactor");
+  const overviewPath = join(refactorDir, "00-总览.md");
+  return {
+    refactorDir,
+    overviewPath,
+    hasOverview: existsSync(overviewPath),
+  };
+}
+
+function listTopLevelDocsMarkdown(projectPath) {
+  const docsDir = join(projectPath, "docs");
+  if (!existsSync(docsDir)) return [];
+  return readdirSync(docsDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
+    .map((entry) => entry.name);
+}
+
+function buildRefactorCompletionSummary(projectPath) {
+  const refactorDir = join(projectPath, "docs", "refactor");
+  const files = existsSync(refactorDir)
+    ? readdirSync(refactorDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b, "zh-CN"))
+    : [];
+  const preview = files.slice(0, 5).join("、");
+  return [
+    "✅ 需求文档分析已完成",
+    `项目：${projectPath}`,
+    `输出文档：${files.length} 份`,
+    preview ? `文件：${preview}${files.length > 5 ? " 等" : ""}` : null,
+    "可先查看 00-总览.md",
+  ].filter(Boolean).join("\n");
+}
+
+function listRefactorMarkdown(projectPath) {
+  const refactorDir = join(projectPath, "docs", "refactor");
+  if (!existsSync(refactorDir)) return [];
+  return readdirSync(refactorDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
+}
+
+function buildStoryMapSyncCompletionSummary(job, replyText) {
+  const summaryLines = String(replyText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-4);
+
+  return [
+    "✅ Story Map 同步已完成",
+    `项目目录：${job.projectPath}`,
+    job.projectId ? `项目 ID：${job.projectId}` : null,
+    summaryLines.length ? "结果摘要：" : null,
+    ...(summaryLines.length ? summaryLines : []),
+  ].filter(Boolean).join("\n");
+}
+
+async function stopAllAnalysisJobs(reason) {
+  const jobs = Array.from(analysisJobs.values());
+  const waitingIds = Array.from(waitingTickets.keys());
+
+  for (const ticketId of waitingIds) {
+    waitingTickets.delete(ticketId);
+  }
+
+  for (const job of jobs) {
+    if (job.connection && job.sessionId) {
+      try { await job.connection.cancel({ sessionId: job.sessionId }); } catch {}
+      try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    }
+
+    updateJob(job.jobId, {
+      status: "failed",
+      stopRequested: true,
+      waitingTicketId: null,
+      latestQuestion: null,
+      latestQuestionContext: null,
+      error: reason,
+    });
+  }
+
+  return { stoppedJobs: jobs.length, clearedTickets: waitingIds.length };
+}
+
+async function processSessionBReply(job, replyText) {
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`分析任务 ${job.jobId} 已被 stop，请忽略本轮 Session B 回复`);
+    return;
+  }
+  const followUp = parseNeedUserInput(replyText);
+  if (followUp) {
+    const ticketId = nextTicketId();
+    const ticket = {
+      ticketId,
+      jobId: job.jobId,
+      jobKind: job.kind,
+      sessionId: job.sessionId,
+      questionText: followUp.question,
+      context: followUp.context,
+      kind: followUp.kind,
+      options: followUp.options,
+      status: "waiting",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    waitingTickets.set(ticketId, ticket);
+    updateJob(job.jobId, {
+      status: "waiting_user",
+      waitingTicketId: ticketId,
+      latestQuestion: ticket.questionText,
+      latestQuestionContext: ticket.context,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    sendQuestionToLark(ticket);
+    return;
+  }
+
+  const fatalExecutionError = detectFatalExecutionError(replyText);
+  if (fatalExecutionError) {
+    updateJob(job.jobId, {
+      status: "failed",
+      error: fatalExecutionError,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark(`❌ 需求文档分析失败：${fatalExecutionError}`);
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  const outputs = ensureRefactorOutputs(job.projectPath);
+  if (!outputs.hasOverview) {
+    const nextRetryCount = (job.outputRetryCount || 0) + 1;
+    updateJob(job.jobId, {
+      status: "running",
+      outputRetryCount: nextRetryCount,
+      latestReplyPreview: replyText.slice(0, 500),
+      error: null,
+    });
+
+    if (nextRetryCount <= 3) {
+      const retryPrompt = [
+        "你刚才的回复还没有对应落盘结果。",
+        `当前仍未检测到输出文件：${outputs.overviewPath}`,
+        "",
+        "请不要只给口头总结，而是立即把重构分析结果真正写入项目文件：",
+        "1. 创建 docs/refactor/ 目录（如果还不存在）",
+        "2. 写入 docs/refactor/00-总览.md",
+        "3. 再写入至少一个 docs/refactor/01-*.md 迭代报告",
+        "4. 写完后再回复我“已写入 docs/refactor/00-总览.md”",
+        "",
+        "如果你缺少信息，请按 NEED_USER_INPUT 协议继续提问。",
+      ].join("\n");
+      await continueRefactorAnalysis(analysisJobs.get(job.jobId), retryPrompt);
+      return;
+    }
+
+    updateJob(job.jobId, {
+      status: "failed",
+      error: `未找到输出文件：${outputs.overviewPath}`,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark(`❌ 需求文档分析失败：未找到输出文件 ${outputs.overviewPath}`);
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  const unresolvedConfirmations = detectUnresolvedConfirmations(replyText);
+  if (unresolvedConfirmations) {
+    const nextRetryCount = (job.unresolvedRetryCount || 0) + 1;
+    updateJob(job.jobId, {
+      status: "running",
+      unresolvedRetryCount: nextRetryCount,
+      latestReplyPreview: replyText.slice(0, 500),
+      error: null,
+    });
+
+    if (nextRetryCount <= 2) {
+      const retryPrompt = [
+        "你刚才的回复里仍然包含未确认事项，但没有按 NEED_USER_INPUT 协议正式发起确认，因此现在不能直接结束分析。",
+        `检测到的未确认内容：${unresolvedConfirmations}`,
+        "",
+        "请按以下规则继续：",
+        "1. 如果这些事项需要用户确认，请立即只输出一个 NEED_USER_INPUT 块，先询问当前最关键的一项。",
+        "2. 不要在同一轮里一边提问、一边继续宣布完成。",
+        "3. 只有在确实无需进一步确认时，才明确说明“无需用户确认，可继续完成”，并去掉“仍待确认/剩余问题/待确认事项”等表述。",
+      ].join("\n");
+      await continueRefactorAnalysis(analysisJobs.get(job.jobId), retryPrompt);
+      return;
+    }
+
+    updateJob(job.jobId, {
+      status: "failed",
+      error: "分析输出仍包含未确认事项，但未按 NEED_USER_INPUT 协议发起提问",
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark("❌ 需求文档分析未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。");
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  updateJob(job.jobId, {
+    status: "completed",
+    latestReplyPreview: replyText.slice(0, 500),
+    outputDir: outputs.refactorDir,
+    overviewPath: outputs.overviewPath,
+  });
+  notifyLark(buildRefactorCompletionSummary(job.projectPath));
+  try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+}
+
+async function continueRefactorAnalysis(job, prompt) {
+  if (!job || isJobStopRequested(job.jobId)) return;
+  updateJob(job.jobId, {
+    status: "running",
+    liveLog: `${job.liveLog || ""}\n\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 开始新一轮分析...\n`.slice(-16000),
+  });
+  let replyText = "";
+  try {
+    replyText = await sendToACP(
+      job.connection,
+      job.client,
+      job.sessionId,
+      prompt,
+      (chunk) => appendJobLiveLog(job.jobId, chunk),
+    );
+  } catch (err) {
+    if (isJobStopRequested(job.jobId)) {
+      log.info(`分析任务 ${job.jobId} 在 sendToACP 期间已被 stop，终止后续处理`);
+      return;
+    }
+    throw err;
+  }
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`分析任务 ${job.jobId} 在收到回复后已被 stop，终止后续处理`);
+    return;
+  }
+  await processSessionBReply(job, replyText);
+}
+
+async function processStoryMapSyncReply(job, replyText) {
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`同步任务 ${job.jobId} 已被 stop，请忽略本轮 Session B 回复`);
+    return;
+  }
+
+  const followUp = parseNeedUserInput(replyText);
+  if (followUp) {
+    const ticketId = nextTicketId();
+    const ticket = {
+      ticketId,
+      jobId: job.jobId,
+      jobKind: job.kind,
+      sessionId: job.sessionId,
+      questionText: followUp.question,
+      context: followUp.context,
+      kind: followUp.kind,
+      options: followUp.options,
+      status: "waiting",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    waitingTickets.set(ticketId, ticket);
+    updateJob(job.jobId, {
+      status: "waiting_user",
+      waitingTicketId: ticketId,
+      latestQuestion: ticket.questionText,
+      latestQuestionContext: ticket.context,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    sendQuestionToLark(ticket);
+    return;
+  }
+
+  const fatalExecutionError = detectFatalExecutionError(replyText);
+  if (fatalExecutionError) {
+    updateJob(job.jobId, {
+      status: "failed",
+      error: fatalExecutionError,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark(`❌ Story Map 同步失败：${fatalExecutionError}`);
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  const unresolvedConfirmations = detectUnresolvedConfirmations(replyText);
+  if (unresolvedConfirmations) {
+    const nextRetryCount = (job.unresolvedRetryCount || 0) + 1;
+    updateJob(job.jobId, {
+      status: "running",
+      unresolvedRetryCount: nextRetryCount,
+      latestReplyPreview: replyText.slice(0, 500),
+      error: null,
+    });
+
+    if (nextRetryCount <= 2) {
+      const retryPrompt = [
+        "你刚才的 Story Map 同步回复里仍然包含未确认事项，但没有按 NEED_USER_INPUT 协议正式发起确认，因此现在不能直接结束同步。",
+        `检测到的未确认内容：${unresolvedConfirmations}`,
+        "",
+        "请按以下规则继续：",
+        "1. 如果这些事项需要用户确认，请立即只输出一个 NEED_USER_INPUT 块，先询问当前最关键的一项。",
+        "2. 不要在同一轮里一边提问、一边继续宣布同步完成。",
+        "3. 只有在确实无需进一步确认时，才明确说明“无需用户确认，可继续完成”，并去掉“仍待确认/剩余问题/待确认事项”等表述。",
+      ].join("\n");
+      await continueStoryMapSync(analysisJobs.get(job.jobId), retryPrompt);
+      return;
+    }
+
+    updateJob(job.jobId, {
+      status: "failed",
+      error: "Story Map 同步输出仍包含未确认事项，但未按 NEED_USER_INPUT 协议发起提问",
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark("❌ Story Map 同步未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。");
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  updateJob(job.jobId, {
+    status: "completed",
+    latestReplyPreview: replyText.slice(0, 500),
+    error: null,
+  });
+  notifyLark(buildStoryMapSyncCompletionSummary(job, replyText));
+  try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+}
+
+async function continueStoryMapSync(job, prompt) {
+  if (!job || isJobStopRequested(job.jobId)) return;
+  updateJob(job.jobId, {
+    status: "running",
+    liveLog: `${job.liveLog || ""}\n\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 开始新一轮 Story Map 同步...\n`.slice(-16000),
+  });
+  let replyText = "";
+  try {
+    replyText = await sendToACP(
+      job.connection,
+      job.client,
+      job.sessionId,
+      prompt,
+      (chunk) => appendJobLiveLog(job.jobId, chunk),
+    );
+  } catch (err) {
+    if (isJobStopRequested(job.jobId)) {
+      log.info(`同步任务 ${job.jobId} 在 sendToACP 期间已被 stop，终止后续处理`);
+      return;
+    }
+    throw err;
+  }
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`同步任务 ${job.jobId} 在收到回复后已被 stop，终止后续处理`);
+    return;
+  }
+  await processStoryMapSyncReply(job, replyText);
+}
+
+async function startRefactorAnalysis(projectPath) {
+  const jobId = `refactor-${Date.now()}`;
+  const docsFiles = listTopLevelDocsMarkdown(projectPath);
+  const job = {
+    kind: "refactor-analysis",
+    jobId,
+    projectPath,
+    status: "starting",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+    latestReplyPreview: null,
+    liveLog: "",
+    outputDir: null,
+    overviewPath: null,
+    outputRetryCount: 0,
+    unresolvedRetryCount: 0,
+    stopRequested: false,
+    error: null,
+    connection: null,
+    client: null,
+    sessionId: null,
+  };
+  analysisJobs.set(jobId, job);
+
+  try {
+    let conn2, client2;
+    for (let i = 1; i <= CONFIG.maxRetries; i++) {
+      try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+      catch (err) {
+        if (i === CONFIG.maxRetries) throw new Error(`Session B 连接失败：${err.message}`);
+        await sleep(2000);
+      }
+    }
+
+    const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [] });
+    updateJob(jobId, {
+      status: "running",
+      connection: conn2,
+      client: client2,
+      sessionId,
+    });
+
+    notifyLark([
+      "📝 已开始需求文档分析。",
+      `项目目录：${projectPath}`,
+      "接下来将调用 refactor-planner 分析 docs/ 下的需求/规格文档，并结合整个项目生成 docs/refactor/ 迭代计划。",
+      "如果过程中有疑问，我会继续在群里提问；届时请把你的回复内容直接当作该问题的答案。",
+    ].join("\n"));
+
+    const prompt = [
+      "请调用 refactor-planner 技能，对当前项目进行重构分析与迭代规划。",
+      "要求：",
+      "1. 当前工作目录就是项目根目录，请同时分析整个项目代码。",
+      "2. 只分析 docs/ 目录根下的需求文档与规格文档，不要读取 docs 的子目录。",
+      `3. 当前可见的 docs 根目录 Markdown 文件有：${docsFiles.length ? docsFiles.join("、") : "（无）"}`,
+      "4. 如果你不确定这些文件里哪些才属于需求/规格文档，先按 NEED_USER_INPUT 协议通过飞书向用户确认，不要自行扩大范围。",
+      "5. 结合已确认的需求/规格文档和现有项目实现，生成迭代计划与重构报告。",
+      "6. 输出结果保存到 docs/refactor/ 目录下，至少包含：",
+      "   - docs/refactor/00-总览.md",
+      "   - docs/refactor/01-*.md",
+      "7. 全程使用中文。",
+      "8. 如果在分析过程中遇到任何无法确认的问题，不要自行假设，请按 NEED_USER_INPUT 协议输出问题。",
+      "",
+      "NEED_USER_INPUT 协议格式如下：",
+      "<<<NEED_USER_INPUT>>>",
+      "question: [要问用户的问题]",
+      "context: [为什么需要确认]",
+      "kind: [问题类型]",
+      "suggested_options:",
+      "- [选项1]",
+      "- [选项2]",
+      "<<<END_NEED_USER_INPUT>>>",
+      "",
+      "在收到用户回答后，请继续分析；如果还需要新的确认，可再次按上述格式提问。",
+    ].join("\n");
+
+    continueRefactorAnalysis(analysisJobs.get(jobId), prompt).catch((err) => {
+      updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+      notifyLark(`❌ 需求文档分析失败：${err?.message || String(err)}`);
+    });
+  } catch (err) {
+    updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+    notifyLark(`❌ 需求文档分析启动失败：${err?.message || String(err)}`);
+  }
+
+  return jobId;
+}
+
+async function startStoryMapSync(projectPath, projectId) {
+  const jobId = `storymap-sync-${Date.now()}`;
+  const refactorFiles = listRefactorMarkdown(projectPath);
+  const job = {
+    kind: "storymap-sync",
+    jobId,
+    projectId,
+    projectPath,
+    status: "starting",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+    latestReplyPreview: null,
+    liveLog: "",
+    unresolvedRetryCount: 0,
+    stopRequested: false,
+    error: null,
+    connection: null,
+    client: null,
+    sessionId: null,
+  };
+  analysisJobs.set(jobId, job);
+
+  try {
+    let conn2, client2;
+    for (let i = 1; i <= CONFIG.maxRetries; i++) {
+      try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+      catch (err) {
+        if (i === CONFIG.maxRetries) throw new Error(`Story Map 同步会话连接失败：${err.message}`);
+        await sleep(2000);
+      }
+    }
+
+    const sysbuilderServer = buildAcpMcpServer(requireConfiguredSysbuilderMcpServer());
+    const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [sysbuilderServer] });
+    updateJob(jobId, {
+      status: "running",
+      connection: conn2,
+      client: client2,
+      sessionId,
+    });
+
+    notifyLark([
+      "🗺️ 已开始 Story Map 同步。",
+      `项目目录：${projectPath}`,
+      projectId ? `项目 ID：${projectId}` : null,
+      "接下来将读取 docs/refactor/ 迭代文档、调用 sysbuilder MCP 读取现有 Story Map，并把明确全新的项补入 Story Map。",
+      "如果过程中存在相近但无法自动判定的项，我会继续在群里提问确认。",
+    ].filter(Boolean).join("\n"));
+
+    const prompt = [
+      "你现在要执行“需求分析结果同步到 Story Map”的任务。",
+      "目标：读取 docs/refactor/ 下的迭代文档，对比 sysbuilder 中当前项目的 Story Map，把明确全新的项新增进去；对完全重复的项跳过；对相近但不完全重复或归属不明确的项，必须先提问确认。",
+      "",
+      "当前上下文：",
+      `- 项目根目录：${projectPath}`,
+      `- 项目 ID：${projectId}`,
+      `- docs/refactor/ 下当前可见的 Markdown 文件：${refactorFiles.length ? refactorFiles.join("、") : "（无）"}`,
+      "",
+      "你必须使用当前已注入的 sysbuilder MCP，并按下面顺序执行：",
+      "1. 先读取本地 docs/refactor/00-总览.md，并按需继续读取 docs/refactor/ 下其他迭代文档，提取候选的 Activity / Epic / Story。",
+      `2. 调用 sysbuilder MCP 工具 get_project_context，参数 projectId='${projectId}'，先理解项目上下文。`,
+      `3. 调用 sysbuilder MCP 工具 load_story_map，参数 projectId='${projectId}'，读取当前 Story Map。`,
+      "4. 先在候选项内部去重，再与现有 Story Map 对比，把候选项严格分成三类：完全重复、相近待确认、明确全新。",
+      "5. 只对“明确全新且父级归属明确”的项执行新增，不要改写、合并、删除已有项。",
+      "",
+      "sysbuilder MCP 工具使用要求：",
+      `- 新增 Activity 时，调用 create_activity，参数至少包含 projectId='${projectId}'、activityName、description（可选）、createdBy='mcp'。`,
+      `- 新增 Epic 时，调用 create_epic，参数至少包含 activityId、epicName、createdBy='mcp'，并附 projectId='${projectId}'。`,
+      "- 新增 Story 时，调用 create_story，参数至少包含 epicId、brief、description（可选）；默认 state='TODO'，workType='USER_STORY'，除非文档明确表明它是技术故事。",
+      "- 不要调用 edit_story、update_story_status 去修改已有项，第一版只允许新增明确全新的项。",
+      "",
+      "判定规则：",
+      "- 完全重复：标题、意图、范围都已被现有 Story Map 覆盖，直接跳过。",
+      "- 相近待确认：语义接近但不完全等同，或可能是现有项的拆分/扩展/重命名，必须提问。",
+      "- 明确全新：现有 Story Map 中没有覆盖，且父级归属明确，可以直接新增。",
+      "",
+      "禁止事项：",
+      "- 不要尝试安装任何本地依赖。",
+      "- 不要尝试从本地源码目录手工启动新的 sysbuilder MCP。",
+      "- 不要绕过当前已注入的 sysbuilder MCP 去构造临时 client。",
+      "",
+      "如果你有任何无法确认的问题，必须按下面协议只输出一个问题块，不要混入其他总结：",
+      "<<<NEED_USER_INPUT>>>",
+      "question: [要问用户的问题]",
+      "context: [为什么需要确认，以及你已经识别到的候选项/相近项背景]",
+      "kind: [storymap-sync]",
+      "suggested_options:",
+      "- [选项1]",
+      "- [选项2]",
+      "<<<END_NEED_USER_INPUT>>>",
+      "",
+      "在收到用户回答后，请继续同步。",
+      "最终完成时请用中文给出简短结果总结，至少说明：新增了多少个 Activity、多少个 Epic、多少个 Story，跳过了多少个重复项，是否还有待确认项。",
+    ].join("\n");
+
+    continueStoryMapSync(analysisJobs.get(jobId), prompt).catch((err) => {
+      updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+      notifyLark(`❌ Story Map 同步失败：${err?.message || String(err)}`);
+    });
+  } catch (err) {
+    updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+    notifyLark(`❌ Story Map 同步启动失败：${err?.message || String(err)}`);
+  }
+
+  return jobId;
+}
+
+function findTicketForAnswer(msgText) {
+  if (!msgText || msgText.startsWith("!")) return null;
+  const explicitId = msgText.match(/\[(Q-\d{8}-\d{3})\]/)?.[1];
+  if (explicitId && waitingTickets.has(explicitId)) {
+    return waitingTickets.get(explicitId);
+  }
+
+  const waiting = Array.from(waitingTickets.values()).filter((ticket) => ticket.status === "waiting");
+  if (waiting.length === 1) {
+    return waiting[0];
+  }
+  return null;
+}
+
+async function resumeRefactorAnalysis(ticket, answerText) {
+  const job = analysisJobs.get(ticket.jobId);
+  if (!job || !job.connection || !job.sessionId) {
+    throw new Error("找不到对应的分析会话，无法继续");
+  }
+
+  waitingTickets.set(ticket.ticketId, { ...ticket, status: "answered", answerText });
+  updateJob(job.jobId, {
+    status: "running",
+    stopRequested: false,
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+  });
+
+  const resumePrompt = [
+    "继续刚才的 refactor-planner 分析任务。",
+    "",
+    "你之前提出的问题是：",
+    ticket.questionText,
+    "",
+    "用户的回答是：",
+    answerText,
+    "",
+    "请基于该回答继续分析，并继续输出到 docs/refactor/。",
+    "如果还有疑问，请继续按 NEED_USER_INPUT 协议输出。",
+  ].join("\n");
+
+  await continueRefactorAnalysis(job, resumePrompt);
+}
+
+async function resumeStoryMapSync(ticket, answerText) {
+  const job = analysisJobs.get(ticket.jobId);
+  if (!job || !job.connection || !job.sessionId) {
+    throw new Error("找不到对应的 Story Map 同步会话，无法继续");
+  }
+
+  waitingTickets.set(ticket.ticketId, { ...ticket, status: "answered", answerText });
+  updateJob(job.jobId, {
+    status: "running",
+    stopRequested: false,
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+  });
+
+  const resumePrompt = [
+    "继续刚才的 Story Map 同步任务。",
+    "",
+    "你之前提出的问题是：",
+    ticket.questionText,
+    "",
+    "用户的回答是：",
+    answerText,
+    "",
+    "请基于该回答继续同步 Story Map。",
+    "如果还有疑问，请继续按 NEED_USER_INPUT 协议输出。",
+  ].join("\n");
+
+  await continueStoryMapSync(job, resumePrompt);
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = "";
+    req.on("data", (chunk) => { raw += chunk.toString(); });
+    req.on("end", () => {
+      try { resolve(raw ? JSON.parse(raw) : {}); }
+      catch (err) { reject(err); }
+    });
+    req.on("error", reject);
+  });
+}
+
+function sendJson(res, statusCode, body) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}
+
+function createHttpServer() {
+  if (bridgeHttpServer) {
+    return bridgeHttpServer;
+  }
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || "/", `http://127.0.0.1:${CONFIG.bridgeHttpPort}`);
+
+      if (req.method === "GET" && url.pathname === "/health") {
+        return sendJson(res, 200, { ok: true, lastChatId, runningJobs: analysisJobs.size });
+      }
+
+      if (req.method === "POST" && url.pathname === "/refactor-analysis/start") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (!lastChatId) {
+          return sendJson(res, 400, { error: "尚无可用的飞书 chat_id，请先在目标群里和 Bot 说一句话，或配置 LARK_CHAT_ID" });
+        }
+        const jobId = await startRefactorAnalysis(projectPath);
+        return sendJson(res, 200, { jobId });
+      }
+
+      if (req.method === "POST" && url.pathname === "/storymap-sync/start") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (!projectId) return sendJson(res, 400, { error: "projectId is required" });
+        if (!lastChatId) {
+          return sendJson(res, 400, { error: "尚无可用的飞书 chat_id，请先在目标群里和 Bot 说一句话，或配置 LARK_CHAT_ID" });
+        }
+        const jobId = await startStoryMapSync(projectPath, projectId);
+        return sendJson(res, 200, { jobId });
+      }
+
+      if (req.method === "GET" && url.pathname === "/refactor-analysis/find") {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        const matches = Array.from(analysisJobs.values())
+          .filter((job) => job.kind === "refactor-analysis" && job.projectPath === projectPath)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        const activeJob = matches.find((job) => job.status !== "completed" && job.status !== "failed") || matches[0];
+        if (!activeJob) return sendJson(res, 404, { error: "job not found" });
+        return sendJson(res, 200, { jobId: activeJob.jobId, status: activeJob.status });
+      }
+
+      if (req.method === "GET" && url.pathname === "/storymap-sync/find") {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        const matches = Array.from(analysisJobs.values())
+          .filter((job) => job.kind === "storymap-sync" && job.projectPath === projectPath)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        const activeJob = matches.find((job) => job.status !== "completed" && job.status !== "failed") || matches[0];
+        if (!activeJob) return sendJson(res, 404, { error: "job not found" });
+        return sendJson(res, 200, { jobId: activeJob.jobId, status: activeJob.status });
+      }
+
+      if (req.method === "GET" && url.pathname === "/refactor-analysis/status") {
+        const jobId = url.searchParams.get("jobId");
+        if (!jobId || !analysisJobs.has(jobId)) return sendJson(res, 404, { error: "job not found" });
+        const job = analysisJobs.get(jobId);
+        const publicJob = { ...job };
+        delete publicJob.connection;
+        delete publicJob.client;
+        return sendJson(res, 200, publicJob);
+      }
+
+      if (req.method === "GET" && url.pathname === "/storymap-sync/status") {
+        const jobId = url.searchParams.get("jobId");
+        if (!jobId || !analysisJobs.has(jobId)) return sendJson(res, 404, { error: "job not found" });
+        const job = analysisJobs.get(jobId);
+        const publicJob = { ...job };
+        delete publicJob.connection;
+        delete publicJob.client;
+        return sendJson(res, 200, publicJob);
+      }
+
+      return sendJson(res, 404, { error: "not found" });
+    } catch (err) {
+      return sendJson(res, 500, { error: err?.message || String(err) });
+    }
+  });
+
+  server.on("error", (err) => {
+    bridgeHttpServer = null;
+    if (err?.code === "EADDRINUSE") {
+      log.error(`[Bridge] HTTP 端口 ${CONFIG.bridgeHttpPort} 已被占用，无法启动本地接口`);
+      return;
+    }
+    log.error(`[Bridge] HTTP 接口异常：${err?.message || String(err)}`);
+  });
+
+  server.listen(CONFIG.bridgeHttpPort, "127.0.0.1", () => {
+    bridgeHttpServer = server;
+    log.info(`[Bridge] HTTP 接口已启动：http://127.0.0.1:${CONFIG.bridgeHttpPort}`);
+  });
+
+  return server;
 }
 
 // ─── 分析任务：临时 ACP Session B ────────────────────────────────────────────
@@ -304,7 +1383,11 @@ async function pollAndProcessReports() {
   try {
     const res = await backendRequest("GET", "/api/reports/pending");
     if (res.status !== 200) return; // 未登录或服务不可达，静默跳过
-    pending = Array.isArray(res.body) ? res.body : [];
+    pending = Array.isArray(res.body?.data)
+      ? res.body.data
+      : Array.isArray(res.body)
+        ? res.body
+        : [];
   } catch { return; } // 后端不可达，静默跳过
 
   if (!pending.length) return;
@@ -312,7 +1395,8 @@ async function pollAndProcessReports() {
   const { reportId, projectId, title, requestContext } = pending[0];
   let ctx = {};
   try { ctx = JSON.parse(requestContext || "{}"); } catch {}
-  const localPath = ctx.localPath;
+  const localPath = ctx.localPath
+    || (typeof ctx.repoUrl === "string" && /^[A-Za-z]:[\\/]/.test(ctx.repoUrl) ? ctx.repoUrl : "");
 
   if (!localPath) {
     log.warn(`报告 ${reportId} 无 localPath，跳过`);
@@ -364,9 +1448,9 @@ async function pollAndProcessReports() {
 function subscribeLarkEvents(onEvent) {
   log.info("启动飞书事件订阅...");
   const proc = spawn(
-    "lark-cli",
+    LARK_CLI_PATH,
     ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
-    { stdio: ["ignore", "pipe", "pipe"], shell: process.platform === "win32" }
+    { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true }
   );
 
   let buffer = "";
@@ -460,7 +1544,29 @@ async function main() {
     log.event(`收到消息 [${event.chat_type}] ${sender} → "${preview}"`);
 
     // 追踪最近活跃的群聊 ID，用于主动推送通知
-    if (event.chat_id) lastChatId = event.chat_id;
+    if (event.chat_id) {
+      lastChatId = event.chat_id;
+      persistLastChatId(lastChatId);
+    }
+
+    const matchedTicket = findTicketForAnswer(msgText);
+    if (matchedTicket) {
+      queue.enqueue(async () => {
+        log.info(`收到问题 ${matchedTicket.ticketId} 的用户答复，准备恢复分析...`);
+        try {
+          notifyLark(`✅ 已收到 [${matchedTicket.ticketId}] 的答复，继续处理中...`);
+          if (matchedTicket.jobKind === "storymap-sync") {
+            await resumeStoryMapSync(matchedTicket, msgText);
+          } else {
+            await resumeRefactorAnalysis(matchedTicket, msgText);
+          }
+        } catch (err) {
+          log.error(`恢复分析失败：${err.message}`);
+          notifyLark(`❌ 恢复分析失败：${err.message}`);
+        }
+      });
+      return;
+    }
 
     // ── 特殊控制指令（不转发给 ACP）──────────────────────────────────────────
     const CMD_STATUS = "!status";
@@ -477,8 +1583,7 @@ async function main() {
       const tmpFile = join(tmpdir(), `bridge-status-${Date.now()}.json`);
       try {
         writeFileSync(tmpFile, postJson, "utf8");
-        const tmpUnix = tmpFile.replace(/\\/g, "/").replace(/^([A-Za-z]):\//, (_, d) => `/${d.toLowerCase()}/`);
-        execSync(`lark-cli im +messages-reply --message-id ${event.message_id} --msg-type post --content "$(cat '${tmpUnix}')"`, { shell: "C:\\Program Files\\Git\\bin\\bash.exe" });
+        execLarkCli(["im", "+messages-reply", "--message-id", event.message_id, "--msg-type", "post", "--content", postJson]);
         log.info(`!status 已回复`);
       } catch (e) {
         log.error(`!status 回复失败：${e.message}`);
@@ -490,13 +1595,21 @@ async function main() {
 
     if (msgText === CMD_STOP) {
       queue.clear();
+      const reason = "已被用户通过 !stop 中止";
+      const { stoppedJobs, clearedTickets } = await stopAllAnalysisJobs(reason);
       try {
-        // session_cancel 是 ACP 协议的取消信令，通知 Copilot 停止当前 prompt，不关闭 session
         await connection.cancel({ sessionId });
-        log.info(`!stop：已发送 cancel 信令到 ACP（session 保持）`);
+        log.info(`!stop：已发送 cancel 信令到主 ACP 会话`);
       } catch (e) { log.warn(`!stop cancel 失败（可能无进行中操作）：${e.message}`); }
       try {
-        execSync(`lark-cli im +messages-reply --message-id ${event.message_id} --text "🛑 已中止当前操作"`, { shell: true });
+        execLarkCli([
+          "im",
+          "+messages-reply",
+          "--message-id",
+          event.message_id,
+          "--text",
+          `🛑 已中止所有会话：主会话已取消，分析会话 ${stoppedJobs} 个，清理待答复问题 ${clearedTickets} 个`,
+        ]);
       } catch (e) { log.error(`!stop 回复失败：${e.message}`); }
       return;
     }
@@ -512,6 +1625,7 @@ async function main() {
   });
 
   log.info("[Bridge] Ready. 正在监听飞书消息...");
+  createHttpServer();
 
   // 启动报告轮询（每隔 pollIntervalMs 检查一次待处理分析任务）
   if (CONFIG.backendUrl) {

@@ -15,7 +15,7 @@ set -euo pipefail
 
 PORT=3000
 AGENT="dawbolong"   # 默认使用大波龙 Agent
-MODEL=""
+MODEL="sonnet4.6"
 NO_AGENT=""
 ACP_EXTRA_ARGS=()
 SESSION_NOTE="就绪"

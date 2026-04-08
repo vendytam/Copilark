@@ -16,7 +16,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=3000
-ACP_FLAGS=""
+ACP_FLAGS="--model=sonnet4.6"
 SESSION_NOTE="新会话"
 SELECTED_AGENT=""   # 由参数或交互选择决定
 BRIDGE_CWD=""       # Bridge/ACP 工作目录，空则交互选择
