@@ -1557,6 +1557,8 @@ async function pollAndProcessReports() {
   const { reportId, projectId, title, requestContext } = pending[0];
   let ctx = {};
   try { ctx = JSON.parse(requestContext || "{}"); } catch {}
+  const reportRouteKey = buildChatRouteKey(ctx.userId, projectId);
+  const reportNotifyChatId = reportRouteKey ? resolveTaskChat(reportRouteKey) : null;
   const localPath = ctx.localPath
     || (typeof ctx.repoUrl === "string" && /^[A-Za-z]:[\\/]/.test(ctx.repoUrl) ? ctx.repoUrl : "");
 
@@ -1568,7 +1570,7 @@ async function pollAndProcessReports() {
   _analysisRunning = true;
   const projectName = localPath.split(/[\\/]/).pop();
   log.info(`🔍 开始处理报告：${title || reportId}（${projectName}）`);
-  notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`);
+  notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`, reportNotifyChatId);
 
   try {
     // 标记为 RUNNING
@@ -1593,7 +1595,7 @@ async function pollAndProcessReports() {
     log.info(`报告 ${reportId} 处理完成，状态：${status}`);
     notifyLark(ok
       ? `✅ 项目 ${projectName} 分析完成，报告已上传，请前往 SysBuilder 查看`
-      : `❌ 项目 ${projectName} 分析失败，请检查日志`);
+      : `❌ 项目 ${projectName} 分析失败，请检查日志`, reportNotifyChatId);
   } catch (err) {
     log.error(`报告处理出错：${err.message}`);
     try {
