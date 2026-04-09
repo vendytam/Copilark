@@ -110,6 +110,7 @@ function resolveCommandSpec(command) {
 const LARK_CLI = process.platform === "win32"
   ? resolveCommandSpec("lark-cli")
   : { path: "lark-cli", useShell: false };
+let _loggedLarkCliSpec = false;
 
 function withLarkCliIdentity(args) {
   const normalizedArgs = args.map((arg) => String(arg));
@@ -119,6 +120,10 @@ function withLarkCliIdentity(args) {
 
 function execLarkCli(args) {
   const normalizedArgs = [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(args)];
+  if (!_loggedLarkCliSpec) {
+    _loggedLarkCliSpec = true;
+    log.info(`Lark CLI 执行入口：path=${LARK_CLI.path} argsPrefix=${JSON.stringify(LARK_CLI.argsPrefix || [])} shell=${Boolean(LARK_CLI.useShell)}`);
+  }
   if (LARK_CLI.useShell) {
     const result = spawnSync(LARK_CLI.path, normalizedArgs, {
       encoding: "utf8",
@@ -475,6 +480,7 @@ function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
   const plainText = String(text || "").replace(/\r\n/g, "\n").trim();
   try {
+    log.info(`notifyLark 调用：chatId=${chatId} textLength=${plainText.length} preview=${JSON.stringify(plainText.slice(0, 40))}`);
     execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
