@@ -130,6 +130,36 @@ function resolvePortableNodePath(candidates) {
   return findFirstExisting([...new Set(directCandidates)]);
 }
 
+function resolveLarkCliExePath(candidates) {
+  const directCandidates = [];
+  for (const line of candidates) {
+    if (/lark-cli\.exe$/i.test(line)) {
+      directCandidates.push(line);
+      continue;
+    }
+    if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
+      const lineDir = dirname(line);
+      directCandidates.push(
+        join(lineDir, "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe"),
+        join(lineDir, "lib", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe"),
+        join(lineDir, "..", "lib", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")
+      );
+      const recursiveExePath = findDescendantFile(lineDir, ["@larksuite", "cli", "bin", "lark-cli.exe"], 6);
+      if (recursiveExePath) directCandidates.push(recursiveExePath);
+    }
+  }
+
+  for (const npmRoot of readGlobalNpmRoots()) {
+    directCandidates.push(join(npmRoot, "@larksuite", "cli", "bin", "lark-cli.exe"));
+  }
+
+  directCandidates.push(
+    join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")
+  );
+
+  return findFirstExisting([...new Set(directCandidates)]);
+}
+
 function resolveLarkCliJsPath(candidates) {
   const directCandidates = [];
   for (const line of candidates) {
@@ -196,6 +226,14 @@ function resolveCommandSpec(command) {
     : [];
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   if (command === "lark-cli" && process.platform === "win32") {
+    const cliExePath = resolveLarkCliExePath(candidates);
+    if (cliExePath) {
+      return {
+        path: cliExePath,
+        argsPrefix: [],
+        useShell: false,
+      };
+    }
     const nodePath = resolvePortableNodePath(candidates);
     const cliJsPath = resolveLarkCliJsPath(candidates);
     if (nodePath && cliJsPath) {
