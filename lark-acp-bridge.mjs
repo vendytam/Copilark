@@ -20,7 +20,7 @@ import https from "node:https";
 import { execSync, execFileSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
@@ -59,8 +59,23 @@ function resolveCommandSpec(command) {
     ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
     ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
+  if (/\.(cmd|bat)$/i.test(resolved)) {
+    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
+    const nodePath = nodePathResult.status === 0
+      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+      : null;
+    const cliJsPath = join(dirname(resolved), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
+    if (nodePath && existsSync(cliJsPath)) {
+      return {
+        path: nodePath,
+        argsPrefix: [cliJsPath],
+        useShell: false,
+      };
+    }
+  }
   return {
     path: resolved,
+    argsPrefix: [],
     useShell: /\.(cmd|bat)$/i.test(resolved),
   };
 }
@@ -76,7 +91,7 @@ function withLarkCliIdentity(args) {
 }
 
 function execLarkCli(args) {
-  const normalizedArgs = withLarkCliIdentity(args);
+  const normalizedArgs = [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(args)];
   if (LARK_CLI.useShell) {
     const result = spawnSync(LARK_CLI.path, normalizedArgs, {
       encoding: "utf8",
@@ -1453,12 +1468,18 @@ async function runAnalysisSession(localPath) {
   const { sessionId: sid2 } = await conn2.newSession({ cwd: localPath, mcpServers: [] });
   log.info(`分析 Session B 已创建：${sid2}`);
 
-  // 构造 CARPM 分析提示词（Copilot 已知 carpm-analyzer skill，无需传路径）
-  const prompt =
-    `请调用 carpm-analyzer 对当前项目进行分析，` +
-    `将报告保存至 docs/carpm-output/carpm-report.md，` +
-    `将 JSON 基线保存至 docs/carpm-output/carpm-baseline.json，` +
-    `全部完成后回复"CARPM 分析完成"。`;
+  const prompt = [
+    "请直接对当前项目源码做完整分析，不要依赖必须预装的自定义 skill。",
+    "如果当前环境里刚好有相关分析 skill 可以自行使用；如果没有，就直接基于代码、配置和目录结构完成分析。",
+    "",
+    "输出要求：",
+    "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
+    "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
+    "3. Markdown 报告至少包含：项目概览、技术栈、核心模块、主要调用链/数据流、高风险热点、歧义点、重构建议。",
+    "4. JSON 基线至少包含：project, techStack, modules, entrypoints, risks, ambiguities 字段。",
+    "5. 全程使用中文。",
+    "6. 全部完成后再回复：CARPM 分析完成。",
+  ].join("\n");
 
   try {
     await sendToACP(conn2, client2, sid2, prompt);
@@ -1561,7 +1582,7 @@ function subscribeLarkEvents(onEvent) {
   log.info("启动飞书事件订阅...");
   const proc = spawn(
     LARK_CLI.path,
-    withLarkCliIdentity(["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"]),
+    [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"])],
     { stdio: ["ignore", "pipe", "pipe"], shell: LARK_CLI.useShell, windowsHide: true }
   );
 
