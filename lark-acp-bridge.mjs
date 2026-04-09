@@ -202,6 +202,7 @@ function resolveCommandSpec(command) {
         path: forcedNodePath,
         argsPrefix: [forcedCliJsPath],
         useShell: false,
+        resolutionSource: "forced-js",
       };
     }
     if (forcedCliPath) {
@@ -209,6 +210,7 @@ function resolveCommandSpec(command) {
         path: forcedCliPath,
         argsPrefix: [],
         useShell: /\.(cmd|bat)$/i.test(forcedCliPath),
+        resolutionSource: "forced-cli",
       };
     }
   }
@@ -227,22 +229,48 @@ function resolveCommandSpec(command) {
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   if (command === "lark-cli" && process.platform === "win32") {
     const cliExePath = resolveLarkCliExePath(candidates);
+    const nodePath = resolvePortableNodePath(candidates);
+    const cliJsPath = resolveLarkCliJsPath(candidates);
+    const diagnostics = {
+      matches: matches.slice(0, 8),
+      candidateCount: candidates.length,
+      cliExePath,
+      cliJsPath,
+      nodePath,
+    };
     if (cliExePath) {
       return {
         path: cliExePath,
         argsPrefix: [],
         useShell: false,
+        resolutionSource: "auto-exe",
+        diagnostics,
       };
     }
-    const nodePath = resolvePortableNodePath(candidates);
-    const cliJsPath = resolveLarkCliJsPath(candidates);
     if (nodePath && cliJsPath) {
       return {
         path: nodePath,
         argsPrefix: [cliJsPath],
         useShell: false,
+        resolutionSource: "auto-js",
+        diagnostics,
       };
     }
+    const fallbackResolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
+      ?? candidates.find((line) => /\.(cmd|bat)$/i.test(line))
+      ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
+      ?? candidates[0];
+    if (!fallbackResolved) throw new Error(`无法定位命令：${command}`);
+    return {
+      path: fallbackResolved,
+      argsPrefix: [],
+      useShell: /\.(cmd|bat)$/i.test(fallbackResolved),
+      resolutionSource: "fallback",
+      diagnostics: {
+        ...diagnostics,
+        fallbackResolved,
+      },
+    };
   }
   const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
     ?? candidates.find((line) => /\.(cmd|bat)$/i.test(line))
@@ -257,6 +285,7 @@ function resolveCommandSpec(command) {
         path: nodePath,
         argsPrefix: [cliJsPath],
         useShell: false,
+        resolutionSource: "shim-js",
       };
     }
   }
@@ -264,6 +293,7 @@ function resolveCommandSpec(command) {
     path: resolved,
     argsPrefix: [],
     useShell: /\.(cmd|bat)$/i.test(resolved),
+    resolutionSource: "resolved",
   };
 }
 
@@ -282,7 +312,10 @@ function execLarkCli(args) {
   const normalizedArgs = [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(args)];
   if (!_loggedLarkCliSpec) {
     _loggedLarkCliSpec = true;
-    log.info(`Lark CLI 执行入口：path=${LARK_CLI.path} argsPrefix=${JSON.stringify(LARK_CLI.argsPrefix || [])} shell=${Boolean(LARK_CLI.useShell)}`);
+    log.info(`Lark CLI 执行入口：path=${LARK_CLI.path} argsPrefix=${JSON.stringify(LARK_CLI.argsPrefix || [])} shell=${Boolean(LARK_CLI.useShell)} source=${LARK_CLI.resolutionSource || "unknown"}`);
+    if (LARK_CLI.diagnostics) {
+      log.info(`Lark CLI 解析诊断：${JSON.stringify(LARK_CLI.diagnostics)}`);
+    }
   }
   if (LARK_CLI.useShell) {
     const result = spawnSync(LARK_CLI.path, normalizedArgs, {
