@@ -334,6 +334,24 @@ function execLarkCli(args) {
   });
 }
 
+function normalizeControlCommand(text) {
+  if (typeof text !== "string") return "";
+  return text
+    .replace(/\u3000/g, " ")
+    .replace(/[！]/g, "!")
+    .replace(/[：]/g, ":")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function parseControlCommand(text) {
+  const normalized = normalizeControlCommand(text);
+  if (/^(?:\S+\s+)?!status(?::.*)?$/.test(normalized)) return "!status";
+  if (/^(?:\S+\s+)?!stop(?::.*)?$/.test(normalized)) return "!stop";
+  return null;
+}
+
 function readJsonFile(filePath, fallback) {
   try {
     return JSON.parse(readFileSync(filePath, "utf8"));
@@ -2096,6 +2114,7 @@ async function main() {
     msgText = msgText.replace(/<at[^>]*>.*?<\/at>/g, "").replace(/@\S+/g, "").trim();
     const preview = msgText.length > 60 ? msgText.slice(0, 60) + "…" : msgText;
     const sender = event.sender_id ? `ou:${event.sender_id.slice(-6)}` : "unknown";
+    const controlCommand = parseControlCommand(msgText);
 
     log.event(`收到消息 [${event.chat_type}] ${sender} → "${preview}"`);
 
@@ -2128,10 +2147,7 @@ async function main() {
     }
 
     // ── 特殊控制指令（不转发给 ACP）──────────────────────────────────────────
-    const CMD_STATUS = "!status";
-    const CMD_STOP   = "!stop";
-
-    if (msgText === CMD_STATUS) {
+    if (controlCommand === "!status") {
       const lines = _logBuffer.slice(-10);
       const statusText = ["📋 Bridge 最近日志：", ...lines].join("\n");
       try {
@@ -2143,7 +2159,7 @@ async function main() {
       return;
     }
 
-    if (msgText === CMD_STOP) {
+    if (controlCommand === "!stop") {
       queue.clear();
       const reason = "已被用户通过 !stop 中止";
       const { stoppedJobs, clearedTickets, stoppedReportRuns } = await stopAllAnalysisJobs(reason);
