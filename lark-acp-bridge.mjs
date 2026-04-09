@@ -393,17 +393,16 @@ function backendRequest(method, urlPath, body) {
     const mod  = full.protocol === "https:" ? https : http;
     const data = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
 
-    // 认证优先级：Bearer token（.env.local）> 自动共享的 Electron session cookie
+    // 桌面端优先使用当前 Electron 会话 cookie，避免被旧的 SYSBUILDER_TOKEN 绑定到错误账号。
     let authHeader = {};
-    if (CONFIG.backendToken) {
+    try {
+      if (existsSync(BRIDGE_AUTH_FILE)) {
+        const cookie = readFileSync(BRIDGE_AUTH_FILE, "utf8").trim();
+        if (cookie) authHeader = { Cookie: cookie };
+      }
+    } catch {}
+    if (!("Cookie" in authHeader) && CONFIG.backendToken) {
       authHeader = { Authorization: `Bearer ${CONFIG.backendToken}` };
-    } else {
-      try {
-        if (existsSync(BRIDGE_AUTH_FILE)) {
-          const cookie = readFileSync(BRIDGE_AUTH_FILE, "utf8").trim();
-          if (cookie) authHeader = { Cookie: cookie };
-        }
-      } catch {}
     }
 
     const headers = {
