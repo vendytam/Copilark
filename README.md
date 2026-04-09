@@ -65,6 +65,30 @@ Agent 文件结构：
 | `git-bash` | Git Bash（mintty 用于弹出新窗口） |
 | `@agentclientprotocol/sdk` | ACP 客户端 SDK（已安装） |
 
+### Windows 安装形态警告
+
+在 Windows 上，`lark-cli` 的安装形态会直接影响 Bridge 的稳定性。
+
+- **推荐**：官方 Node.js 安装器 + 默认全局 npm 路径
+- **推荐执行入口**：
+  - `lark-cli.exe`
+  - 或 `node.exe <...>\@larksuite\cli\bin\lark-cli.js`
+- **高风险形态**：
+  - 只安装出 `lark-cli.cmd`
+  - 并且运行时退回 `shell=true`
+
+高风险形态下，Bridge 主动发送飞书消息时，中文或 emoji 参数可能被 Windows `cmd` 包装层截断。
+
+安装 `lark-cli` 后，建议先检查：
+
+```powershell
+where lark-cli
+npm root -g
+Test-Path ((npm root -g) + '\@larksuite\cli\bin\lark-cli.js')
+```
+
+如果 `where lark-cli` 只返回 `.cmd`，且找不到 `lark-cli.js`，请优先修正 Node/npm 的全局安装布局，再继续配置 Copilark。
+
 ## 飞书平台配置（必须）
 
 在 [飞书开放平台控制台](https://open.feishu.cn/) 完成：

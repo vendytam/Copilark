@@ -90,6 +90,29 @@ function parseCliShimJsPath(shimPath) {
   }
 }
 
+function findDescendantFile(startDir, segments, maxDepth = 5) {
+  if (!startDir || !existsSync(startDir) || maxDepth < 0) return null;
+  const expectedLeaf = segments[segments.length - 1]?.toLowerCase();
+  try {
+    const entries = readdirSync(startDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = join(startDir, entry.name);
+      if (entry.isDirectory()) {
+        const nested = findDescendantFile(entryPath, segments, maxDepth - 1);
+        if (nested) return nested;
+        continue;
+      }
+      if (!entry.isFile() || entry.name.toLowerCase() !== expectedLeaf) continue;
+      const normalized = entryPath.toLowerCase().replace(/\//g, "\\");
+      const expectedSuffix = segments.join("\\").toLowerCase();
+      if (normalized.endsWith(expectedSuffix)) return entryPath;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 function resolvePortableNodePath(candidates) {
   const directCandidates = [findCommandPath("node")];
   for (const line of candidates) {
@@ -118,6 +141,8 @@ function resolveLarkCliJsPath(candidates) {
       );
       const shimJsPath = parseCliShimJsPath(line);
       if (shimJsPath) directCandidates.push(shimJsPath);
+      const recursiveJsPath = findDescendantFile(lineDir, ["@larksuite", "cli", "bin", "lark-cli.js"], 6);
+      if (recursiveJsPath) directCandidates.push(recursiveJsPath);
     }
   }
 

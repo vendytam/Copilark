@@ -18,6 +18,26 @@ npm install -g @larksuite/cli
 安装 CLI SKILL（必需）
 npx skills add larksuite/cli -y -g
 
+Windows 安装注意（重要）：
+- **推荐使用官方 Node.js 安装器并保持默认全局 npm 路径**，不要用 portable Node、绿色版 Node，或手动执行 `npm config set prefix D:\\...` 把全局包装到自定义目录。
+- Copilark 在 Windows 下更稳定的形态是：
+  - `lark-cli.exe`
+  - 或 `node.exe <...>\\@larksuite\\cli\\bin\\lark-cli.js`
+- **最容易出问题的是**：只暴露出 `lark-cli.cmd`，并且实际执行退回 `shell=true`。这种情况下，飞书消息里的中文 / emoji 参数可能被 Windows `cmd` 包装层截断或转义异常。
+
+安装后请立刻自检：
+```powershell
+where lark-cli
+npm root -g
+Test-Path ((npm root -g) + '\@larksuite\cli\bin\lark-cli.js')
+```
+
+如果你看到：
+- `where lark-cli` 只返回 `*.cmd`
+- 并且 `lark-cli.js` 不存在
+
+请优先重装为默认 Node/npm 全局路径，再继续后续步骤。
+
 #第 2 步 — 配置应用凭证
 在后台运行此命令，命令会输出一个授权链接，提取该链接并发送给用户，用户在浏览器中完成配置后命令会自动退出。
 lark-cli config init --new
