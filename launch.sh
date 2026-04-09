@@ -16,7 +16,7 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORT=3000
-ACP_FLAGS=""
+ACP_FLAGS="--model=sonnet4.6"
 SESSION_NOTE="新会话"
 SELECTED_AGENT=""   # 由参数或交互选择决定
 BRIDGE_CWD=""       # Bridge/ACP 工作目录，空则交互选择
@@ -190,6 +190,15 @@ open_new_bash_window() {
 }
 
 # ─── 环境检查 ──────────────────────────────────────────────────────────────────
+# 加载可选的本地 env 文件（存放 SYSBUILDER_TOKEN 等敏感配置，不提交 git）
+if [ -f "$DIR/.env.local" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$DIR/.env.local"
+  set +a
+  ok ".env.local 已加载"
+fi
+
 echo ""
 echo "========================================"
 echo "   Copilark  Launch (Git Bash)"
@@ -264,7 +273,7 @@ if [ -n "$SELECTED_AGENT" ] && [ "$SELECTED_AGENT" != "__none__" ]; then
     warn "Agent 文件不存在，跳过同步：$AGENT_FILE_UNIX"
   fi
 fi
-BRIDGE_CMD="cd '$DIR' && BRIDGE_CWD='${BRIDGE_CWD_WIN}' node lark-acp-bridge.mjs"
+BRIDGE_CMD="cd '$DIR' && BRIDGE_CWD='${BRIDGE_CWD_WIN}' SYSBUILDER_TOKEN='${SYSBUILDER_TOKEN:-}' SYSBUILDER_BACKEND_URL='${SYSBUILDER_BACKEND_URL:-http://47.79.4.19}' node lark-acp-bridge.mjs"
 open_new_bash_window "Lark ACP Bridge" "$BRIDGE_CMD"
 ok "窗口 2 已打开 — Lark ACP Bridge  (cwd: $BRIDGE_CWD, agent: ${SELECTED_AGENT:-无})"
 
