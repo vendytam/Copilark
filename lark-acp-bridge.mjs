@@ -43,6 +43,7 @@ const CONFIG = {
 const SESSION_FILE    = join(import.meta.dirname, ".acp-session-id");
 const BRIDGE_AUTH_FILE = join(homedir(), ".copilark", "bridge-auth.txt");
 const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
+const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
 function resolveCommandPath(command) {
@@ -239,6 +240,8 @@ const log = {
 // ─── lastChatId（报告完成通知目标群）─────────────────────────────────────────
 
 let lastChatId = CONFIG.defaultChatId || null; // 每次收到飞书事件时更新，用于主动推送 Lark 通知
+let lastChatIdSource = CONFIG.defaultChatId ? "env" : null;
+let chatRouteMap = readJsonFile(CHAT_ROUTE_FILE, {});
 const analysisJobs = new Map();
 const waitingTickets = new Map();
 let questionSeq = 0;
@@ -247,7 +250,10 @@ let bridgeHttpServer = null;
 try {
   if (!lastChatId && existsSync(LAST_CHAT_ID_FILE)) {
     const savedChatId = readFileSync(LAST_CHAT_ID_FILE, "utf8").trim();
-    if (savedChatId) lastChatId = savedChatId;
+    if (savedChatId) {
+      lastChatId = savedChatId;
+      lastChatIdSource = "persisted";
+    }
   }
 } catch {}
 
@@ -258,6 +264,49 @@ function persistLastChatId(chatId) {
   } catch (err) {
     log.warn(`persistLastChatId 失败：${err?.message || String(err)}`);
   }
+}
+
+function buildChatRouteKey(userId, projectId) {
+  const normalizedUserId = typeof userId === "string" ? userId.trim() : "";
+  if (!normalizedUserId) return null;
+  const normalizedProjectId = typeof projectId === "string" ? projectId.trim() : "";
+  return `${normalizedUserId}::${normalizedProjectId || "__global__"}`;
+}
+
+function normalizeChatRouteMap(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.entries(value).reduce((acc, [key, entry]) => {
+    if (typeof entry === "string" && key.trim() && entry.trim()) acc[key.trim()] = entry.trim();
+    return acc;
+  }, {});
+}
+
+function persistChatRoute(routeKey, chatId) {
+  if (!routeKey || !chatId) return;
+  chatRouteMap = {
+    ...normalizeChatRouteMap(chatRouteMap),
+    [routeKey]: chatId,
+  };
+  try {
+    writeFileSync(CHAT_ROUTE_FILE, JSON.stringify(chatRouteMap, null, 2), "utf8");
+  } catch (err) {
+    log.warn(`persistChatRoute 失败：${err?.message || String(err)}`);
+  }
+}
+
+function resolveTaskChat(routeKey) {
+  const currentChatId = getCurrentTaskChatId();
+  if (currentChatId) {
+    if (routeKey) persistChatRoute(routeKey, currentChatId);
+    return currentChatId;
+  }
+
+  const normalizedMap = normalizeChatRouteMap(chatRouteMap);
+  if (routeKey && normalizedMap[routeKey]) {
+    return normalizedMap[routeKey];
+  }
+
+  return null;
 }
 
 // ─── 后端 HTTP 工具 ───────────────────────────────────────────────────────────
@@ -306,8 +355,14 @@ function backendRequest(method, urlPath, body) {
 
 // ─── 飞书群主动通知 ───────────────────────────────────────────────────────────
 
-function notifyLark(text) {
-  if (!lastChatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
+function getCurrentTaskChatId() {
+  if (!lastChatId) return null;
+  if (lastChatIdSource === "persisted") return null;
+  return lastChatId;
+}
+
+function notifyLark(text, chatId = lastChatId) {
+  if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
   const lines = text.split(/\r?\n/).filter((line) => line.length > 0);
   const contentLines = lines.length > 0
     ? lines.map((line) => [{ tag: "text", text: line }])
@@ -316,8 +371,8 @@ function notifyLark(text) {
   const tmpFile = join(tmpdir(), `bridge-notify-${Date.now()}.json`);
   try {
     writeFileSync(tmpFile, postJson, "utf8");
-    execLarkCli(["im", "+messages-send", "--chat-id", lastChatId, "--msg-type", "post", "--content", postJson]);
-    log.info(`Lark 通知已发送到 ${lastChatId}：${text.slice(0, 80)}`);
+    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--msg-type", "post", "--content", postJson]);
+    log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
   } finally {
@@ -343,11 +398,18 @@ async function connectToACP() {
           clientCapabilities: { fs: { readTextFile: true, writeTextFile: true } },
         });
         log.info(`ACP 握手成功，协议版本：${init.protocolVersion}`);
-        resolve({ connection, client });
+        resolve({ connection, client, socket });
       } catch (err) { reject(err); }
     });
     socket.on("error", reject);
   });
+}
+
+function destroyJobTransport(job) {
+  const socket = job?.socket;
+  if (!socket) return;
+  try { socket.end(); } catch {}
+  try { socket.destroy(); } catch {}
 }
 
 async function ensureSession(connection) {
@@ -518,8 +580,8 @@ function nextTicketId() {
 }
 
 function sendQuestionToLark(ticket) {
-  if (!lastChatId) {
-    throw new Error("当前没有可用的飞书 chat_id，请先在群里和 Bot 说一句话");
+  if (!ticket.chatId) {
+    throw new Error("当前任务没有可用的飞书 chat_id，请先在目标群里和 Bot 说一句话，或配置 LARK_CHAT_ID");
   }
 
   const lines = [
@@ -532,7 +594,7 @@ function sendQuestionToLark(ticket) {
     "注意：此时你的回复内容会被当作该问题的答案继续送回分析流程，请尽量直接回答，不要闲聊。",
     ...(ticket.options.length ? ["可选：", ...ticket.options.map((opt, i) => `${i + 1}. ${opt}`)] : []),
   ].filter(Boolean);
-  notifyLark(lines.join("\n"));
+  notifyLark(lines.join("\n"), ticket.chatId);
 }
 
 function updateJob(jobId, patch) {
@@ -642,6 +704,7 @@ async function stopAllAnalysisJobs(reason) {
       try { await job.connection.cancel({ sessionId: job.sessionId }); } catch {}
       try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     }
+    destroyJobTransport(job);
 
     updateJob(job.jobId, {
       status: "failed",
@@ -650,6 +713,9 @@ async function stopAllAnalysisJobs(reason) {
       latestQuestion: null,
       latestQuestionContext: null,
       error: reason,
+      connection: null,
+      client: null,
+      socket: null,
     });
   }
 
@@ -668,6 +734,7 @@ async function processSessionBReply(job, replyText) {
       ticketId,
       jobId: job.jobId,
       jobKind: job.kind,
+      chatId: job.notifyChatId,
       sessionId: job.sessionId,
       questionText: followUp.question,
       context: followUp.context,
@@ -696,7 +763,7 @@ async function processSessionBReply(job, replyText) {
       error: fatalExecutionError,
       latestReplyPreview: replyText.slice(0, 500),
     });
-    notifyLark(`❌ 需求文档分析失败：${fatalExecutionError}`);
+    notifyLark(`❌ 需求文档分析失败：${fatalExecutionError}`, job.notifyChatId);
     try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     return;
   }
@@ -733,7 +800,7 @@ async function processSessionBReply(job, replyText) {
       error: `未找到输出文件：${outputs.overviewPath}`,
       latestReplyPreview: replyText.slice(0, 500),
     });
-    notifyLark(`❌ 需求文档分析失败：未找到输出文件 ${outputs.overviewPath}`);
+    notifyLark(`❌ 需求文档分析失败：未找到输出文件 ${outputs.overviewPath}`, job.notifyChatId);
     try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     return;
   }
@@ -767,7 +834,7 @@ async function processSessionBReply(job, replyText) {
       error: "分析输出仍包含未确认事项，但未按 NEED_USER_INPUT 协议发起提问",
       latestReplyPreview: replyText.slice(0, 500),
     });
-    notifyLark("❌ 需求文档分析未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。");
+    notifyLark("❌ 需求文档分析未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。", job.notifyChatId);
     try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     return;
   }
@@ -778,7 +845,7 @@ async function processSessionBReply(job, replyText) {
     outputDir: outputs.refactorDir,
     overviewPath: outputs.overviewPath,
   });
-  notifyLark(buildRefactorCompletionSummary(job.projectPath));
+  notifyLark(buildRefactorCompletionSummary(job.projectPath), job.notifyChatId);
   try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
 }
 
@@ -824,6 +891,7 @@ async function processStoryMapSyncReply(job, replyText) {
       ticketId,
       jobId: job.jobId,
       jobKind: job.kind,
+      chatId: job.notifyChatId,
       sessionId: job.sessionId,
       questionText: followUp.question,
       context: followUp.context,
@@ -852,7 +920,7 @@ async function processStoryMapSyncReply(job, replyText) {
       error: fatalExecutionError,
       latestReplyPreview: replyText.slice(0, 500),
     });
-    notifyLark(`❌ Story Map 同步失败：${fatalExecutionError}`);
+    notifyLark(`❌ Story Map 同步失败：${fatalExecutionError}`, job.notifyChatId);
     try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     return;
   }
@@ -886,7 +954,7 @@ async function processStoryMapSyncReply(job, replyText) {
       error: "Story Map 同步输出仍包含未确认事项，但未按 NEED_USER_INPUT 协议发起提问",
       latestReplyPreview: replyText.slice(0, 500),
     });
-    notifyLark("❌ Story Map 同步未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。");
+    notifyLark("❌ Story Map 同步未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议提问。", job.notifyChatId);
     try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
     return;
   }
@@ -896,7 +964,7 @@ async function processStoryMapSyncReply(job, replyText) {
     latestReplyPreview: replyText.slice(0, 500),
     error: null,
   });
-  notifyLark(buildStoryMapSyncCompletionSummary(job, replyText));
+  notifyLark(buildStoryMapSyncCompletionSummary(job, replyText), job.notifyChatId);
   try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
 }
 
@@ -929,8 +997,13 @@ async function continueStoryMapSync(job, prompt) {
   await processStoryMapSyncReply(job, replyText);
 }
 
-async function startRefactorAnalysis(projectPath) {
+async function startRefactorAnalysis(projectPath, options = {}) {
   const jobId = `refactor-${Date.now()}`;
+  const routeKey = buildChatRouteKey(options.userId, options.projectId);
+  const notifyChatId = resolveTaskChat(routeKey);
+  if (!notifyChatId) {
+    throw new Error("当前没有可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID");
+  }
   const docsFiles = listTopLevelDocsMarkdown(projectPath);
   const job = {
     kind: "refactor-analysis",
@@ -948,18 +1021,21 @@ async function startRefactorAnalysis(projectPath) {
     overviewPath: null,
     outputRetryCount: 0,
     unresolvedRetryCount: 0,
+    notifyChatId,
+    routeKey,
     stopRequested: false,
     error: null,
     connection: null,
     client: null,
+    socket: null,
     sessionId: null,
   };
   analysisJobs.set(jobId, job);
 
   try {
-    let conn2, client2;
+    let conn2, client2, socket2;
     for (let i = 1; i <= CONFIG.maxRetries; i++) {
-      try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+      try { ({ connection: conn2, client: client2, socket: socket2 } = await connectToACP()); break; }
       catch (err) {
         if (i === CONFIG.maxRetries) throw new Error(`Session B 连接失败：${err.message}`);
         await sleep(2000);
@@ -971,6 +1047,7 @@ async function startRefactorAnalysis(projectPath) {
       status: "running",
       connection: conn2,
       client: client2,
+      socket: socket2,
       sessionId,
     });
 
@@ -979,7 +1056,7 @@ async function startRefactorAnalysis(projectPath) {
       `项目目录：${projectPath}`,
       "接下来将调用 refactor-planner 分析 docs/ 下的需求/规格文档，并结合整个项目生成 docs/refactor/ 迭代计划。",
       "如果过程中有疑问，我会继续在群里提问；届时请把你的回复内容直接当作该问题的答案。",
-    ].join("\n"));
+    ].join("\n"), notifyChatId);
 
     const prompt = [
       "请调用 refactor-planner 技能，对当前项目进行重构分析与迭代规划。",
@@ -1010,18 +1087,23 @@ async function startRefactorAnalysis(projectPath) {
 
     continueRefactorAnalysis(analysisJobs.get(jobId), prompt).catch((err) => {
       updateJob(jobId, { status: "failed", error: err?.message || String(err) });
-      notifyLark(`❌ 需求文档分析失败：${err?.message || String(err)}`);
+      notifyLark(`❌ 需求文档分析失败：${err?.message || String(err)}`, notifyChatId);
     });
   } catch (err) {
     updateJob(jobId, { status: "failed", error: err?.message || String(err) });
-    notifyLark(`❌ 需求文档分析启动失败：${err?.message || String(err)}`);
+    notifyLark(`❌ 需求文档分析启动失败：${err?.message || String(err)}`, notifyChatId);
   }
 
   return jobId;
 }
 
-async function startStoryMapSync(projectPath, projectId) {
+async function startStoryMapSync(projectPath, projectId, options = {}) {
   const jobId = `storymap-sync-${Date.now()}`;
+  const routeKey = buildChatRouteKey(options.userId, projectId);
+  const notifyChatId = resolveTaskChat(routeKey);
+  if (!notifyChatId) {
+    throw new Error("当前没有可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID");
+  }
   const refactorFiles = listRefactorMarkdown(projectPath);
   const job = {
     kind: "storymap-sync",
@@ -1036,6 +1118,8 @@ async function startStoryMapSync(projectPath, projectId) {
     latestQuestionContext: null,
     latestReplyPreview: null,
     liveLog: "",
+    notifyChatId,
+    routeKey,
     unresolvedRetryCount: 0,
     stopRequested: false,
     error: null,
@@ -1046,9 +1130,9 @@ async function startStoryMapSync(projectPath, projectId) {
   analysisJobs.set(jobId, job);
 
   try {
-    let conn2, client2;
+    let conn2, client2, socket2;
     for (let i = 1; i <= CONFIG.maxRetries; i++) {
-      try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+      try { ({ connection: conn2, client: client2, socket: socket2 } = await connectToACP()); break; }
       catch (err) {
         if (i === CONFIG.maxRetries) throw new Error(`Story Map 同步会话连接失败：${err.message}`);
         await sleep(2000);
@@ -1061,6 +1145,7 @@ async function startStoryMapSync(projectPath, projectId) {
       status: "running",
       connection: conn2,
       client: client2,
+      socket: socket2,
       sessionId,
     });
 
@@ -1070,7 +1155,7 @@ async function startStoryMapSync(projectPath, projectId) {
       projectId ? `项目 ID：${projectId}` : null,
       "接下来将读取 docs/refactor/ 迭代文档、调用 sysbuilder MCP 读取现有 Story Map，并把明确全新的项补入 Story Map。",
       "如果过程中存在相近但无法自动判定的项，我会继续在群里提问确认。",
-    ].filter(Boolean).join("\n"));
+    ].filter(Boolean).join("\n"), notifyChatId);
 
     const prompt = [
       "你现在要执行“需求分析结果同步到 Story Map”的任务。",
@@ -1120,11 +1205,11 @@ async function startStoryMapSync(projectPath, projectId) {
 
     continueStoryMapSync(analysisJobs.get(jobId), prompt).catch((err) => {
       updateJob(jobId, { status: "failed", error: err?.message || String(err) });
-      notifyLark(`❌ Story Map 同步失败：${err?.message || String(err)}`);
+      notifyLark(`❌ Story Map 同步失败：${err?.message || String(err)}`, notifyChatId);
     });
   } catch (err) {
     updateJob(jobId, { status: "failed", error: err?.message || String(err) });
-    notifyLark(`❌ Story Map 同步启动失败：${err?.message || String(err)}`);
+    notifyLark(`❌ Story Map 同步启动失败：${err?.message || String(err)}`, notifyChatId);
   }
 
   return jobId;
@@ -1239,11 +1324,13 @@ function createHttpServer() {
       if (req.method === "POST" && url.pathname === "/refactor-analysis/start") {
         const body = await readJsonBody(req);
         const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        const userId = typeof body.userId === "string" ? body.userId.trim() : "";
         if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
-        if (!lastChatId) {
-          return sendJson(res, 400, { error: "尚无可用的飞书 chat_id，请先在目标群里和 Bot 说一句话，或配置 LARK_CHAT_ID" });
+        if (!resolveTaskChat(buildChatRouteKey(userId, projectId))) {
+          return sendJson(res, 400, { error: "尚无可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID" });
         }
-        const jobId = await startRefactorAnalysis(projectPath);
+        const jobId = await startRefactorAnalysis(projectPath, { userId, projectId });
         return sendJson(res, 200, { jobId });
       }
 
@@ -1251,12 +1338,13 @@ function createHttpServer() {
         const body = await readJsonBody(req);
         const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
         const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        const userId = typeof body.userId === "string" ? body.userId.trim() : "";
         if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
         if (!projectId) return sendJson(res, 400, { error: "projectId is required" });
-        if (!lastChatId) {
-          return sendJson(res, 400, { error: "尚无可用的飞书 chat_id，请先在目标群里和 Bot 说一句话，或配置 LARK_CHAT_ID" });
+        if (!resolveTaskChat(buildChatRouteKey(userId, projectId))) {
+          return sendJson(res, 400, { error: "尚无可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID" });
         }
-        const jobId = await startStoryMapSync(projectPath, projectId);
+        const jobId = await startStoryMapSync(projectPath, projectId, { userId });
         return sendJson(res, 200, { jobId });
       }
 
@@ -1546,6 +1634,7 @@ async function main() {
     // 追踪最近活跃的群聊 ID，用于主动推送通知
     if (event.chat_id) {
       lastChatId = event.chat_id;
+      lastChatIdSource = "event";
       persistLastChatId(lastChatId);
     }
 
@@ -1554,7 +1643,7 @@ async function main() {
       queue.enqueue(async () => {
         log.info(`收到问题 ${matchedTicket.ticketId} 的用户答复，准备恢复分析...`);
         try {
-          notifyLark(`✅ 已收到 [${matchedTicket.ticketId}] 的答复，继续处理中...`);
+          notifyLark(`✅ 已收到 [${matchedTicket.ticketId}] 的答复，继续处理中...`, matchedTicket.chatId);
           if (matchedTicket.jobKind === "storymap-sync") {
             await resumeStoryMapSync(matchedTicket, msgText);
           } else {
@@ -1562,7 +1651,7 @@ async function main() {
           }
         } catch (err) {
           log.error(`恢复分析失败：${err.message}`);
-          notifyLark(`❌ 恢复分析失败：${err.message}`);
+          notifyLark(`❌ 恢复分析失败：${err.message}`, matchedTicket.chatId);
         }
       });
       return;
