@@ -347,8 +347,8 @@ function normalizeControlCommand(text) {
 
 function parseControlCommand(text) {
   const normalized = normalizeControlCommand(text);
-  if (/^(?:\S+\s+)?!status(?::.*)?$/.test(normalized)) return "!status";
-  if (/^(?:\S+\s+)?!stop(?::.*)?$/.test(normalized)) return "!stop";
+  if (/(^|\s)!status(?::.*)?$/.test(normalized)) return "!status";
+  if (/(^|\s)!stop(?::.*)?$/.test(normalized)) return "!stop";
   return null;
 }
 
