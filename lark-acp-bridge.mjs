@@ -69,8 +69,14 @@ const LARK_CLI = process.platform === "win32"
   ? resolveCommandSpec("lark-cli")
   : { path: "lark-cli", useShell: false };
 
-function execLarkCli(args) {
+function withLarkCliIdentity(args) {
   const normalizedArgs = args.map((arg) => String(arg));
+  if (normalizedArgs.includes("--as")) return normalizedArgs;
+  return ["--as", "bot", ...normalizedArgs];
+}
+
+function execLarkCli(args) {
+  const normalizedArgs = withLarkCliIdentity(args);
   if (LARK_CLI.useShell) {
     const result = spawnSync(LARK_CLI.path, normalizedArgs, {
       encoding: "utf8",
@@ -1555,7 +1561,7 @@ function subscribeLarkEvents(onEvent) {
   log.info("启动飞书事件订阅...");
   const proc = spawn(
     LARK_CLI.path,
-    ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
+    withLarkCliIdentity(["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"]),
     { stdio: ["ignore", "pipe", "pipe"], shell: LARK_CLI.useShell, windowsHide: true }
   );
 
