@@ -51,9 +51,36 @@ function resolveCommandSpec(command) {
   if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
   const matches = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const extraCandidates = command === "lark-cli" && process.platform === "win32"
-    ? [join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")]
+    ? [
+        join(process.env.APPDATA || "", "npm", "lark-cli.cmd"),
+        join(process.env.APPDATA || "", "npm", "lark-cli"),
+        join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"),
+        join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe"),
+      ]
     : [];
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
+  if (command === "lark-cli" && process.platform === "win32") {
+    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
+    const nodePath = nodePathResult.status === 0
+      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+      : null;
+    const cliJsPath = candidates
+      .map((line) => {
+        if (/lark-cli\.js$/i.test(line)) return line;
+        if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
+          return join(dirname(line), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
+        }
+        return null;
+      })
+      .find((line) => line && existsSync(line));
+    if (nodePath && cliJsPath) {
+      return {
+        path: nodePath,
+        argsPrefix: [cliJsPath],
+        useShell: false,
+      };
+    }
+  }
   const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
     ?? candidates.find((line) => /\.(cmd|bat)$/i.test(line))
     ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
