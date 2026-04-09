@@ -20,7 +20,7 @@ import https from "node:https";
 import { execSync, execFileSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
@@ -46,25 +46,96 @@ const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
 const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
-function resolveCommandPath(command) {
+function resolveCommandSpec(command) {
   const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
   if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
   const matches = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const extraCandidates = command === "lark-cli" && process.platform === "win32"
-    ? [join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")]
+    ? [
+        join(process.env.APPDATA || "", "npm", "lark-cli.cmd"),
+        join(process.env.APPDATA || "", "npm", "lark-cli"),
+        join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"),
+        join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe"),
+      ]
     : [];
-  const candidates = [...matches, ...extraCandidates].filter(Boolean);
+  const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
+  if (command === "lark-cli" && process.platform === "win32") {
+    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
+    const nodePath = nodePathResult.status === 0
+      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+      : null;
+    const cliJsPath = candidates
+      .map((line) => {
+        if (/lark-cli\.js$/i.test(line)) return line;
+        if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
+          return join(dirname(line), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
+        }
+        return null;
+      })
+      .find((line) => line && existsSync(line));
+    if (nodePath && cliJsPath) {
+      return {
+        path: nodePath,
+        argsPrefix: [cliJsPath],
+        useShell: false,
+      };
+    }
+  }
   const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
+    ?? candidates.find((line) => /\.(cmd|bat)$/i.test(line))
     ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
-    ?? matches[0];
+    ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
-  return resolved;
+  if (/\.(cmd|bat)$/i.test(resolved)) {
+    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
+    const nodePath = nodePathResult.status === 0
+      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
+      : null;
+    const cliJsPath = join(dirname(resolved), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
+    if (nodePath && existsSync(cliJsPath)) {
+      return {
+        path: nodePath,
+        argsPrefix: [cliJsPath],
+        useShell: false,
+      };
+    }
+  }
+  return {
+    path: resolved,
+    argsPrefix: [],
+    useShell: /\.(cmd|bat)$/i.test(resolved),
+  };
 }
 
-const LARK_CLI_PATH = process.platform === "win32" ? resolveCommandPath("lark-cli") : "lark-cli";
+const LARK_CLI = process.platform === "win32"
+  ? resolveCommandSpec("lark-cli")
+  : { path: "lark-cli", useShell: false };
+let _loggedLarkCliSpec = false;
+
+function withLarkCliIdentity(args) {
+  const normalizedArgs = args.map((arg) => String(arg));
+  if (normalizedArgs.includes("--as")) return normalizedArgs;
+  return ["--as", "bot", ...normalizedArgs];
+}
 
 function execLarkCli(args) {
-  return execFileSync(LARK_CLI_PATH, args.map((arg) => String(arg)), {
+  const normalizedArgs = [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(args)];
+  if (!_loggedLarkCliSpec) {
+    _loggedLarkCliSpec = true;
+    log.info(`Lark CLI 执行入口：path=${LARK_CLI.path} argsPrefix=${JSON.stringify(LARK_CLI.argsPrefix || [])} shell=${Boolean(LARK_CLI.useShell)}`);
+  }
+  if (LARK_CLI.useShell) {
+    const result = spawnSync(LARK_CLI.path, normalizedArgs, {
+      encoding: "utf8",
+      windowsHide: true,
+      shell: true,
+    });
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || "").toString().trim() || `lark-cli 执行失败，退出码=${result.status}`);
+    }
+    return (result.stdout || "").toString();
+  }
+  return execFileSync(LARK_CLI.path, normalizedArgs, {
     encoding: "utf8",
     windowsHide: true,
   });
@@ -223,6 +294,24 @@ let _streaming = false; // 是否正在流式输出 Copilot 回复
 
 const _logBuffer = [];       // 最近 N 行日志
 const LOG_BUFFER_SIZE = 20;
+let _ignoredAcpAbortLogged = false;
+
+function isExpectedAcpAbortError(error) {
+  if (!error) return false;
+  const queue = [error];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    const code = typeof current.code === "string" ? current.code : "";
+    const message = typeof current.message === "string" ? current.message : "";
+    if (code === "ABORT_ERR" || code === "ERR_STREAM_PREMATURE_CLOSE") return true;
+    if (/AbortError|Premature close/i.test(message)) return true;
+    if (current.cause && typeof current.cause === "object") queue.push(current.cause);
+  }
+  return false;
+}
 
 function bufferLog(line) {
   _logBuffer.push(line);
@@ -235,6 +324,18 @@ const log = {
   warn:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][WARN]  ${a.join(" ")}`; bufferLog(l); console.warn(l); },
   error: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][ERROR] ${a.join(" ")}`; bufferLog(l); console.error(l); },
   event: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][EVENT] ${a.join(" ")}`; bufferLog(l); console.log(l); },
+};
+
+const originalConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  if (args[0] === "ACP write error:" && isExpectedAcpAbortError(args[1])) {
+    if (!_ignoredAcpAbortLogged) {
+      _ignoredAcpAbortLogged = true;
+      log.warn("ACP 写流在连接关闭后中止，已忽略预期的 AbortError");
+    }
+    return;
+  }
+  originalConsoleError(...args);
 };
 
 // ─── lastChatId（报告完成通知目标群）─────────────────────────────────────────
@@ -306,6 +407,20 @@ function resolveTaskChat(routeKey) {
     return normalizedMap[routeKey];
   }
 
+  if (routeKey && routeKey.includes("::")) {
+    const globalRouteKey = routeKey.replace(/::.*$/, "::__global__");
+    if (normalizedMap[globalRouteKey]) {
+      return normalizedMap[globalRouteKey];
+    }
+  }
+
+  const persistedChatId = getCurrentTaskChatId({ allowPersisted: true });
+  if (routeKey && persistedChatId) {
+    persistChatRoute(routeKey, persistedChatId);
+    log.info(`使用已持久化 chat_id 作为任务通知路由：${routeKey} -> ${persistedChatId}`);
+    return persistedChatId;
+  }
+
   return null;
 }
 
@@ -317,17 +432,16 @@ function backendRequest(method, urlPath, body) {
     const mod  = full.protocol === "https:" ? https : http;
     const data = body ? Buffer.from(JSON.stringify(body), "utf8") : null;
 
-    // 认证优先级：Bearer token（.env.local）> 自动共享的 Electron session cookie
+    // 桌面端优先使用当前 Electron 会话 cookie，避免被旧的 SYSBUILDER_TOKEN 绑定到错误账号。
     let authHeader = {};
-    if (CONFIG.backendToken) {
+    try {
+      if (existsSync(BRIDGE_AUTH_FILE)) {
+        const cookie = readFileSync(BRIDGE_AUTH_FILE, "utf8").trim();
+        if (cookie) authHeader = { Cookie: cookie };
+      }
+    } catch {}
+    if (!("Cookie" in authHeader) && CONFIG.backendToken) {
       authHeader = { Authorization: `Bearer ${CONFIG.backendToken}` };
-    } else {
-      try {
-        if (existsSync(BRIDGE_AUTH_FILE)) {
-          const cookie = readFileSync(BRIDGE_AUTH_FILE, "utf8").trim();
-          if (cookie) authHeader = { Cookie: cookie };
-        }
-      } catch {}
     }
 
     const headers = {
@@ -355,28 +469,22 @@ function backendRequest(method, urlPath, body) {
 
 // ─── 飞书群主动通知 ───────────────────────────────────────────────────────────
 
-function getCurrentTaskChatId() {
+function getCurrentTaskChatId(options = {}) {
+  const allowPersisted = options.allowPersisted === true;
   if (!lastChatId) return null;
-  if (lastChatIdSource === "persisted") return null;
+  if (!allowPersisted && lastChatIdSource === "persisted") return null;
   return lastChatId;
 }
 
 function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
-  const lines = text.split(/\r?\n/).filter((line) => line.length > 0);
-  const contentLines = lines.length > 0
-    ? lines.map((line) => [{ tag: "text", text: line }])
-    : [[{ tag: "text", text }]];
-  const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
-  const tmpFile = join(tmpdir(), `bridge-notify-${Date.now()}.json`);
+  const plainText = String(text || "").replace(/\r\n/g, "\n").trim();
   try {
-    writeFileSync(tmpFile, postJson, "utf8");
-    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--msg-type", "post", "--content", postJson]);
+    log.info(`notifyLark 调用：chatId=${chatId} textLength=${plainText.length} preview=${JSON.stringify(plainText.slice(0, 40))}`);
+    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
   }
 }
 
@@ -407,9 +515,14 @@ async function connectToACP() {
 
 function destroyJobTransport(job) {
   const socket = job?.socket;
-  if (!socket) return;
+  if (!socket || socket.destroyed || job?._transportClosing) return;
+  if (job && typeof job === "object") job._transportClosing = true;
   try { socket.end(); } catch {}
-  try { socket.destroy(); } catch {}
+  setTimeout(() => {
+    if (!socket.destroyed) {
+      try { socket.destroy(); } catch {}
+    }
+  }, 250).unref?.();
 }
 
 async function ensureSession(connection) {
@@ -691,9 +804,19 @@ function buildStoryMapSyncCompletionSummary(job, replyText) {
   ].filter(Boolean).join("\n");
 }
 
+function abortReportRun(reportRun, reason) {
+  if (!reportRun) return false;
+  reportRun.stopRequested = true;
+  if (typeof reportRun.abort === "function") {
+    reportRun.abort(new Error(reason || "报告分析已取消"));
+  }
+  return true;
+}
+
 async function stopAllAnalysisJobs(reason) {
   const jobs = Array.from(analysisJobs.values());
   const waitingIds = Array.from(waitingTickets.keys());
+  let stoppedReportRuns = 0;
 
   for (const ticketId of waitingIds) {
     waitingTickets.delete(ticketId);
@@ -719,7 +842,16 @@ async function stopAllAnalysisJobs(reason) {
     });
   }
 
-  return { stoppedJobs: jobs.length, clearedTickets: waitingIds.length };
+  const reportRun = activeReportRun;
+  if (reportRun?.connection && reportRun?.sessionId) {
+    abortReportRun(reportRun, reason);
+    try { await reportRun.connection.cancel({ sessionId: reportRun.sessionId }); } catch {}
+    try { await reportRun.connection.closeSession({ sessionId: reportRun.sessionId }); } catch {}
+    destroyJobTransport(reportRun);
+    stoppedReportRuns = 1;
+  }
+
+  return { stoppedJobs: jobs.length, clearedTickets: waitingIds.length, stoppedReportRuns };
 }
 
 async function processSessionBReply(job, replyText) {
@@ -1050,6 +1182,12 @@ async function startRefactorAnalysis(projectPath, options = {}) {
       socket: socket2,
       sessionId,
     });
+    if (isJobStopRequested(jobId)) {
+      try { await conn2.cancel({ sessionId }); } catch {}
+      try { await conn2.closeSession({ sessionId }); } catch {}
+      destroyJobTransport({ socket: socket2 });
+      return jobId;
+    }
 
     notifyLark([
       "📝 已开始需求文档分析。",
@@ -1148,6 +1286,12 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
       socket: socket2,
       sessionId,
     });
+    if (isJobStopRequested(jobId)) {
+      try { await conn2.cancel({ sessionId }); } catch {}
+      try { await conn2.closeSession({ sessionId }); } catch {}
+      destroyJobTransport({ socket: socket2 });
+      return jobId;
+    }
 
     notifyLark([
       "🗺️ 已开始 Story Map 同步。",
@@ -1390,6 +1534,21 @@ function createHttpServer() {
         return sendJson(res, 200, publicJob);
       }
 
+      if (req.method === "POST" && url.pathname === "/report-analysis/cancel") {
+        const body = await readJsonBody(req);
+        const reportId = typeof body.reportId === "string" ? body.reportId.trim() : "";
+        if (!reportId) return sendJson(res, 400, { error: "reportId is required" });
+        const reportRun = activeReportRun;
+        if (!reportRun || reportRun.reportId !== reportId) {
+          return sendJson(res, 200, { stopped: false });
+        }
+        abortReportRun(reportRun, "已通过删除报告取消当前分析");
+        try { await reportRun.connection?.cancel({ sessionId: reportRun.sessionId }); } catch {}
+        try { await reportRun.connection?.closeSession({ sessionId: reportRun.sessionId }); } catch {}
+        destroyJobTransport(reportRun);
+        return sendJson(res, 200, { stopped: true });
+      }
+
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {
       return sendJson(res, 500, { error: err?.message || String(err) });
@@ -1415,11 +1574,11 @@ function createHttpServer() {
 
 // ─── 分析任务：临时 ACP Session B ────────────────────────────────────────────
 
-async function runAnalysisSession(localPath) {
+async function runAnalysisSession(localPath, options = {}) {
   log.info(`创建分析 Session B（cwd: ${localPath}）...`);
-  let conn2, client2;
+  let conn2, client2, socket2;
   for (let i = 1; i <= CONFIG.maxRetries; i++) {
-    try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+    try { ({ connection: conn2, client: client2, socket: socket2 } = await connectToACP()); break; }
     catch (err) {
       if (i === CONFIG.maxRetries) throw new Error(`Session B 连接失败：${err.message}`);
       await sleep(2000);
@@ -1429,18 +1588,47 @@ async function runAnalysisSession(localPath) {
   const { sessionId: sid2 } = await conn2.newSession({ cwd: localPath, mcpServers: [] });
   log.info(`分析 Session B 已创建：${sid2}`);
 
-  // 构造 CARPM 分析提示词（Copilot 已知 carpm-analyzer skill，无需传路径）
-  const prompt =
-    `请调用 carpm-analyzer 对当前项目进行分析，` +
-    `将报告保存至 docs/carpm-output/carpm-report.md，` +
-    `将 JSON 基线保存至 docs/carpm-output/carpm-baseline.json，` +
-    `全部完成后回复"CARPM 分析完成"。`;
+  const reportRun = {
+    reportId: typeof options.reportId === "string" ? options.reportId.trim() : "",
+    projectId: typeof options.projectId === "string" ? options.projectId.trim() : "",
+    localPath,
+    connection: conn2,
+    client: client2,
+    socket: socket2,
+    sessionId: sid2,
+    stopRequested: false,
+    abort: null,
+  };
+  reportRun.abortPromise = new Promise((_, reject) => {
+    reportRun.abort = (error) => reject(error || new Error("报告分析已取消"));
+  });
+  activeReportRun = reportRun;
+
+  const prompt = [
+    "请调用 carpm-analyzer 对当前项目进行完整 CARPM 分析。",
+    "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
+    "",
+    "输出要求：",
+    "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
+    "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
+    "3. 全程使用中文。",
+    "4. 全部完成后再回复：CARPM 分析完成。",
+  ].join("\n");
 
   try {
-    await sendToACP(conn2, client2, sid2, prompt);
+    await Promise.race([
+      sendToACP(conn2, client2, sid2, prompt),
+      reportRun.abortPromise,
+    ]);
   } finally {
     try { await conn2.closeSession({ sessionId: sid2 }); } catch {}
+    destroyJobTransport(reportRun);
+    if (activeReportRun === reportRun) activeReportRun = null;
     log.info(`分析 Session B 已关闭：${sid2}`);
+  }
+
+  if (reportRun.stopRequested) {
+    throw new Error("已取消当前报告分析");
   }
 
   // 读取分析输出文件（Agent 已写入项目目录）
@@ -1459,42 +1647,113 @@ async function runAnalysisSession(localPath) {
 // ─── 报告轮询 & 处理 ──────────────────────────────────────────────────────────
 
 let _analysisRunning = false;
+let activeReportRun = null;
+let lastReportPollNotice = "";
+let lastReportPollIdentity = null;
+let lastReportPollIdentityAt = 0;
+
+function logReportPollNotice(level, message) {
+  if (!message || lastReportPollNotice === message) return;
+  lastReportPollNotice = message;
+  const logger = typeof log[level] === "function" ? log[level] : log.info;
+  logger(message);
+}
+
+function clearReportPollNotice() {
+  lastReportPollNotice = "";
+}
+
+async function fetchReportPollIdentity() {
+  const now = Date.now();
+  if (lastReportPollIdentity && now - lastReportPollIdentityAt < 60_000) {
+    return lastReportPollIdentity;
+  }
+
+  try {
+    const res = await backendRequest("GET", "/api/auth/me");
+    if (res.status !== 200) {
+      lastReportPollIdentity = null;
+      lastReportPollIdentityAt = now;
+      return null;
+    }
+    const profile = res.body?.data || res.body;
+    const identity = profile?.userId || profile?.username || profile?.email || null;
+    lastReportPollIdentity = typeof identity === "string" && identity.trim() ? identity.trim() : null;
+    lastReportPollIdentityAt = now;
+    return lastReportPollIdentity;
+  } catch {
+    lastReportPollIdentity = null;
+    lastReportPollIdentityAt = now;
+    return null;
+  }
+}
 
 async function pollAndProcessReports() {
   if (_analysisRunning) return;
   if (!CONFIG.backendToken && !existsSync(BRIDGE_AUTH_FILE)) {
-    // 未配置 token 且 Electron 尚未登录（无共享 cookie 文件），静默跳过
+    logReportPollNotice("warn", "报告轮询跳过：Bridge 尚未拿到后端认证，请确认 Electron 已登录并同步 bridge-auth.txt，或显式配置 SYSBUILDER_TOKEN");
     return;
   }
 
   let pending;
   try {
     const res = await backendRequest("GET", "/api/reports/pending");
-    if (res.status !== 200) return; // 未登录或服务不可达，静默跳过
+    if (res.status !== 200) {
+      logReportPollNotice("warn", `报告轮询跳过：读取 /api/reports/pending 失败（HTTP ${res.status}）`);
+      return;
+    }
     pending = Array.isArray(res.body?.data)
       ? res.body.data
       : Array.isArray(res.body)
         ? res.body
         : [];
-  } catch { return; } // 后端不可达，静默跳过
+  } catch (err) {
+    logReportPollNotice("warn", `报告轮询跳过：后端不可达（${err?.message || String(err)}）`);
+    return;
+  }
 
-  if (!pending.length) return;
+  clearReportPollNotice();
+
+  if (!pending.length) {
+    const identity = await fetchReportPollIdentity();
+    logReportPollNotice(
+      "info",
+      identity
+        ? `报告轮询在线：当前 Bridge 认证用户为 ${identity}，暂未发现该用户的待处理报告`
+        : "报告轮询在线：已连接后端，但暂未发现待处理报告",
+    );
+    return;
+  }
+
+  clearReportPollNotice();
 
   const { reportId, projectId, title, requestContext } = pending[0];
   let ctx = {};
   try { ctx = JSON.parse(requestContext || "{}"); } catch {}
+  const reportRouteKey = buildChatRouteKey(ctx.userId, projectId);
+  const reportNotifyChatId = reportRouteKey ? resolveTaskChat(reportRouteKey) : null;
   const localPath = ctx.localPath
     || (typeof ctx.repoUrl === "string" && /^[A-Za-z]:[\\/]/.test(ctx.repoUrl) ? ctx.repoUrl : "");
 
   if (!localPath) {
-    log.warn(`报告 ${reportId} 无 localPath，跳过`);
+    const failMessage = "缺少可用的本地项目路径（localPath）。请在桌面端为项目选择本地路径后重新创建分析任务。";
+    log.warn(`报告 ${reportId} 无 localPath，已标记失败`);
+    try {
+      await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`, {
+        status: "FAILED",
+        reportMarkdown: `## 分析未启动\n\n${failMessage}`,
+      });
+    } catch (updateErr) {
+      log.error(`报告 ${reportId} 标记失败时出错：${updateErr?.message || String(updateErr)}`);
+    }
+    notifyLark(`❌ 项目 ${title || projectId} 分析未启动：${failMessage}`, reportNotifyChatId);
     return;
   }
 
   _analysisRunning = true;
   const projectName = localPath.split(/[\\/]/).pop();
   log.info(`🔍 开始处理报告：${title || reportId}（${projectName}）`);
-  notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`);
+  notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`, reportNotifyChatId);
 
   try {
     // 标记为 RUNNING
@@ -1504,7 +1763,7 @@ async function pollAndProcessReports() {
     let markdown = "", baselineJson = null;
     let status = "COMPLETED";
     try {
-      ({ markdown, baselineJson } = await runAnalysisSession(localPath));
+      ({ markdown, baselineJson } = await runAnalysisSession(localPath, { reportId, projectId }));
     } catch (err) {
       log.error(`分析失败：${err.message}`);
       status = "FAILED";
@@ -1519,7 +1778,7 @@ async function pollAndProcessReports() {
     log.info(`报告 ${reportId} 处理完成，状态：${status}`);
     notifyLark(ok
       ? `✅ 项目 ${projectName} 分析完成，报告已上传，请前往 SysBuilder 查看`
-      : `❌ 项目 ${projectName} 分析失败，请检查日志`);
+      : `❌ 项目 ${projectName} 分析失败，请检查日志`, reportNotifyChatId);
   } catch (err) {
     log.error(`报告处理出错：${err.message}`);
     try {
@@ -1536,9 +1795,9 @@ async function pollAndProcessReports() {
 function subscribeLarkEvents(onEvent) {
   log.info("启动飞书事件订阅...");
   const proc = spawn(
-    LARK_CLI_PATH,
-    ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
-    { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true }
+    LARK_CLI.path,
+    [...(LARK_CLI.argsPrefix || []), ...withLarkCliIdentity(["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"])],
+    { stdio: ["ignore", "pipe", "pipe"], shell: LARK_CLI.useShell, windowsHide: true }
   );
 
   let buffer = "";
@@ -1636,6 +1895,8 @@ async function main() {
       lastChatId = event.chat_id;
       lastChatIdSource = "event";
       persistLastChatId(lastChatId);
+      const senderRouteKey = buildChatRouteKey(event.sender_id, "");
+      if (senderRouteKey) persistChatRoute(senderRouteKey, lastChatId);
     }
 
     const matchedTicket = findTicketForAnswer(msgText);
@@ -1663,21 +1924,12 @@ async function main() {
 
     if (msgText === CMD_STATUS) {
       const lines = _logBuffer.slice(-10);
-      // 构造 post 格式 JSON，每行独立段落，避免 md tag 把 \n 渲染成字面量 <br>
-      const contentLines = [
-        [{ tag: "text", text: "📋 Bridge 最近日志：" }],
-        ...lines.map(l => [{ tag: "text", text: l }]),
-      ];
-      const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
-      const tmpFile = join(tmpdir(), `bridge-status-${Date.now()}.json`);
+      const statusText = ["📋 Bridge 最近日志：", ...lines].join("\n");
       try {
-        writeFileSync(tmpFile, postJson, "utf8");
-        execLarkCli(["im", "+messages-reply", "--message-id", event.message_id, "--msg-type", "post", "--content", postJson]);
+        execLarkCli(["im", "+messages-reply", "--message-id", event.message_id, "--text", statusText]);
         log.info(`!status 已回复`);
       } catch (e) {
         log.error(`!status 回复失败：${e.message}`);
-      } finally {
-        try { unlinkSync(tmpFile); } catch {}
       }
       return;
     }
@@ -1685,7 +1937,7 @@ async function main() {
     if (msgText === CMD_STOP) {
       queue.clear();
       const reason = "已被用户通过 !stop 中止";
-      const { stoppedJobs, clearedTickets } = await stopAllAnalysisJobs(reason);
+      const { stoppedJobs, clearedTickets, stoppedReportRuns } = await stopAllAnalysisJobs(reason);
       try {
         await connection.cancel({ sessionId });
         log.info(`!stop：已发送 cancel 信令到主 ACP 会话`);
@@ -1697,7 +1949,7 @@ async function main() {
           "--message-id",
           event.message_id,
           "--text",
-          `🛑 已中止所有会话：主会话已取消，分析会话 ${stoppedJobs} 个，清理待答复问题 ${clearedTickets} 个`,
+          `🛑 已中止所有会话：主会话已取消，任务会话 ${stoppedJobs} 个，报告会话 ${stoppedReportRuns} 个，清理待答复问题 ${clearedTickets} 个`,
         ]);
       } catch (e) { log.error(`!stop 回复失败：${e.message}`); }
       return;
