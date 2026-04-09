@@ -1045,10 +1045,41 @@ function buildStoryMapSyncCompletionSummary(job, replyText) {
 function abortReportRun(reportRun, reason) {
   if (!reportRun) return false;
   reportRun.stopRequested = true;
+  reportRun.updatedAt = new Date().toISOString();
+  if (reason) {
+    reportRun.error = reason;
+    reportRun.liveLog = ((reportRun.liveLog || "") + `\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] ${reason}\n`).slice(-16000);
+  }
   if (typeof reportRun.abort === "function") {
     reportRun.abort(new Error(reason || "报告分析已取消"));
   }
   return true;
+}
+
+function appendReportLiveLog(reportRun, chunk) {
+  if (!reportRun || !chunk) return;
+  reportRun.liveLog = ((reportRun.liveLog || "") + chunk).slice(-16000);
+  reportRun.updatedAt = new Date().toISOString();
+}
+
+function updateReportRun(reportRun, patch) {
+  if (!reportRun) return;
+  Object.assign(reportRun, patch, { updatedAt: new Date().toISOString() });
+}
+
+function getPublicReportRun(reportRun) {
+  if (!reportRun) return null;
+  return {
+    reportId: reportRun.reportId,
+    projectId: reportRun.projectId,
+    localPath: reportRun.localPath,
+    sessionId: reportRun.sessionId,
+    status: reportRun.status || "idle",
+    liveLog: reportRun.liveLog || "",
+    error: reportRun.error || null,
+    updatedAt: reportRun.updatedAt || null,
+    stopRequested: Boolean(reportRun.stopRequested),
+  };
 }
 
 async function stopAllAnalysisJobs(reason) {
@@ -1805,6 +1836,23 @@ function createHttpServer() {
         return sendJson(res, 200, { stopped: true });
       }
 
+      if (req.method === "GET" && url.pathname === "/report-analysis/status") {
+        const reportId = (url.searchParams.get("reportId") || "").trim();
+        if (!reportId) return sendJson(res, 400, { error: "reportId is required" });
+        const reportRun = activeReportRun;
+        if (!reportRun || reportRun.reportId !== reportId) {
+          return sendJson(res, 200, {
+            reportId,
+            status: "idle",
+            liveLog: "",
+            error: null,
+            updatedAt: null,
+            stopRequested: false,
+          });
+        }
+        return sendJson(res, 200, getPublicReportRun(reportRun));
+      }
+
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {
       return sendJson(res, 500, { error: err?.message || String(err) });
@@ -1848,6 +1896,10 @@ async function runAnalysisSession(localPath, options = {}) {
     reportId: typeof options.reportId === "string" ? options.reportId.trim() : "",
     projectId: typeof options.projectId === "string" ? options.projectId.trim() : "",
     localPath,
+    status: "starting",
+    liveLog: "",
+    error: null,
+    updatedAt: new Date().toISOString(),
     connection: conn2,
     client: client2,
     socket: socket2,
@@ -1872,14 +1924,16 @@ async function runAnalysisSession(localPath, options = {}) {
   ].join("\n");
 
   try {
+    updateReportRun(reportRun, { status: "running" });
+    appendReportLiveLog(reportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已启动 CARPM 分析会话\n`);
     await Promise.race([
-      sendToACP(conn2, client2, sid2, prompt),
+      sendToACP(conn2, client2, sid2, prompt, (chunk) => appendReportLiveLog(reportRun, chunk)),
       reportRun.abortPromise,
     ]);
+    updateReportRun(reportRun, { status: "completed" });
   } finally {
     try { await conn2.closeSession({ sessionId: sid2 }); } catch {}
     destroyJobTransport(reportRun);
-    if (activeReportRun === reportRun) activeReportRun = null;
     log.info(`分析 Session B 已关闭：${sid2}`);
   }
 
@@ -1896,6 +1950,7 @@ async function runAnalysisSession(localPath, options = {}) {
 
   if (!markdown) throw new Error(`报告文件未生成：${reportPath}`);
   log.info(`报告文件已读取（${Math.round(markdown.length / 1024)}KB）`);
+  appendReportLiveLog(reportRun, `\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已生成报告文件并读取完成\n`);
 
   return { markdown, baselineJson };
 }
@@ -2010,6 +2065,7 @@ async function pollAndProcessReports() {
   const projectName = localPath.split(/[\\/]/).pop();
   log.info(`🔍 开始处理报告：${title || reportId}（${projectName}）`);
   notifyLark(`🔍 开始分析项目：${projectName}，请稍候...`, reportNotifyChatId);
+  appendReportLiveLog(activeReportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] Bridge 已接管报告分析：${title || reportId}\n`);
 
   try {
     // 标记为 RUNNING
@@ -2024,6 +2080,8 @@ async function pollAndProcessReports() {
       log.error(`分析失败：${err.message}`);
       status = "FAILED";
       markdown = `## 分析失败\n\n${err.message}`;
+      updateReportRun(activeReportRun, { status: "failed", error: err.message });
+      appendReportLiveLog(activeReportRun, `\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 分析失败：${err.message}\n`);
     }
 
     const submitBody = { reportMarkdown: markdown, status };
@@ -2032,16 +2090,20 @@ async function pollAndProcessReports() {
 
     const ok = status === "COMPLETED";
     log.info(`报告 ${reportId} 处理完成，状态：${status}`);
+    if (ok) appendReportLiveLog(activeReportRun, `\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 报告已提交到 SysBuilder\n`);
     notifyLark(ok
       ? `✅ 项目 ${projectName} 分析完成，报告已上传，请前往 SysBuilder 查看`
       : `❌ 项目 ${projectName} 分析失败，请检查日志`, reportNotifyChatId);
   } catch (err) {
     log.error(`报告处理出错：${err.message}`);
+    updateReportRun(activeReportRun, { status: "failed", error: err.message });
+    appendReportLiveLog(activeReportRun, `\n[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 报告处理出错：${err.message}\n`);
     try {
       await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`,
         { status: "FAILED", reportMarkdown: `## 处理出错\n\n${err.message}` });
     } catch {}
   } finally {
+    if (activeReportRun?.reportId === reportId) activeReportRun = null;
     _analysisRunning = false;
   }
 }
