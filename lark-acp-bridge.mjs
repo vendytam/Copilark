@@ -497,6 +497,16 @@ function buildAcpMcpServer(server) {
   };
 }
 
+function getDefaultBridgeMcpServers() {
+  try {
+    const configured = loadConfiguredSysbuilderMcpServer();
+    if (!configured) return [];
+    return [buildAcpMcpServer(configured)];
+  } catch {
+    return [];
+  }
+}
+
 // ─── ACP Client ───────────────────────────────────────────────────────────────
 
 let _streaming = false; // 是否正在流式输出 Copilot 回复
@@ -753,6 +763,7 @@ function destroyJobTransport(job) {
 }
 
 async function ensureSession(connection) {
+  const defaultMcpServers = getDefaultBridgeMcpServers();
   if (acpSessionId) {
     log.info(`恢复已有 ACP 会话：${acpSessionId}`);
     return acpSessionId;
@@ -760,13 +771,13 @@ async function ensureSession(connection) {
 
   // 尝试从文件恢复上次的 session ID
   if (existsSync(SESSION_FILE)) {
-    const savedId = readFileSync(SESSION_FILE, "utf8").trim();
-    if (savedId) {
-      try {
-        await connection.loadSession({ sessionId: savedId, cwd: CONFIG.cwd, mcpServers: [] });
-        acpSessionId = savedId;
-        log.info(`✅ 已恢复上次会话：${acpSessionId}`);
-        return acpSessionId;
+      const savedId = readFileSync(SESSION_FILE, "utf8").trim();
+      if (savedId) {
+        try {
+          await connection.loadSession({ sessionId: savedId, cwd: CONFIG.cwd, mcpServers: defaultMcpServers });
+          acpSessionId = savedId;
+          log.info(`✅ 已恢复上次会话：${acpSessionId}`);
+          return acpSessionId;
       } catch (err) {
         log.warn(`上次会话 ${savedId} 无法恢复（${err?.message}），将重连后创建新会话...`);
         writeFileSync(SESSION_FILE, "", "utf8"); // 先清空，重连后直接走 newSession
@@ -776,10 +787,10 @@ async function ensureSession(connection) {
   }
 
   // 创建新会话并持久化
-  const result = await connection.newSession({ cwd: CONFIG.cwd, mcpServers: [] });
+  const result = await connection.newSession({ cwd: CONFIG.cwd, mcpServers: defaultMcpServers });
   acpSessionId = result.sessionId;
   writeFileSync(SESSION_FILE, acpSessionId, "utf8");
-  log.info(`创建新 ACP 会话：${acpSessionId}  (cwd: ${CONFIG.cwd})`);
+  log.info(`创建新 ACP 会话：${acpSessionId}  (cwd: ${CONFIG.cwd}, mcpServers: ${defaultMcpServers.length})`);
   return acpSessionId;
 }
 
@@ -1504,8 +1515,26 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
       }
     }
 
-    const sysbuilderServer = buildAcpMcpServer(requireConfiguredSysbuilderMcpServer());
+    const configuredSysbuilderServer = requireConfiguredSysbuilderMcpServer();
+    log.info(`Story Map 同步注入 sysbuilder MCP：${JSON.stringify(
+      configuredSysbuilderServer.type === "stdio"
+        ? {
+            type: configuredSysbuilderServer.type,
+            name: configuredSysbuilderServer.name,
+            command: configuredSysbuilderServer.command,
+            args: configuredSysbuilderServer.args,
+            envKeys: Object.keys(configuredSysbuilderServer.env || {}),
+          }
+        : {
+            type: configuredSysbuilderServer.type,
+            name: configuredSysbuilderServer.name,
+            url: configuredSysbuilderServer.url,
+            headerKeys: Object.keys(configuredSysbuilderServer.headers || {}),
+          }
+    )}`);
+    const sysbuilderServer = buildAcpMcpServer(configuredSysbuilderServer);
     const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [sysbuilderServer] });
+    log.info(`Story Map 同步 Session B 已创建：${sessionId}（mcpServers: 1）`);
     updateJob(jobId, {
       status: "running",
       connection: conn2,
