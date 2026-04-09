@@ -402,9 +402,9 @@ function getCurrentTaskChatId() {
 
 function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
-  const plainText = String(text || "").split(/\r?\n/).filter((line) => line.length > 0).join("\n");
+  const markdownText = String(text || "").split(/\r?\n/).filter((line) => line.length > 0).join("\n\n");
   try {
-    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
+    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--markdown", markdownText || String(text || "")]);
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
