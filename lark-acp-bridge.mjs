@@ -262,6 +262,24 @@ let _streaming = false; // 是否正在流式输出 Copilot 回复
 
 const _logBuffer = [];       // 最近 N 行日志
 const LOG_BUFFER_SIZE = 20;
+let _ignoredAcpAbortLogged = false;
+
+function isExpectedAcpAbortError(error) {
+  if (!error) return false;
+  const queue = [error];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    const code = typeof current.code === "string" ? current.code : "";
+    const message = typeof current.message === "string" ? current.message : "";
+    if (code === "ABORT_ERR" || code === "ERR_STREAM_PREMATURE_CLOSE") return true;
+    if (/AbortError|Premature close/i.test(message)) return true;
+    if (current.cause && typeof current.cause === "object") queue.push(current.cause);
+  }
+  return false;
+}
 
 function bufferLog(line) {
   _logBuffer.push(line);
@@ -274,6 +292,18 @@ const log = {
   warn:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][WARN]  ${a.join(" ")}`; bufferLog(l); console.warn(l); },
   error: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][ERROR] ${a.join(" ")}`; bufferLog(l); console.error(l); },
   event: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][EVENT] ${a.join(" ")}`; bufferLog(l); console.log(l); },
+};
+
+const originalConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  if (args[0] === "ACP write error:" && isExpectedAcpAbortError(args[1])) {
+    if (!_ignoredAcpAbortLogged) {
+      _ignoredAcpAbortLogged = true;
+      log.warn("ACP 写流在连接关闭后中止，已忽略预期的 AbortError");
+    }
+    return;
+  }
+  originalConsoleError(...args);
 };
 
 // ─── lastChatId（报告完成通知目标群）─────────────────────────────────────────
@@ -445,9 +475,14 @@ async function connectToACP() {
 
 function destroyJobTransport(job) {
   const socket = job?.socket;
-  if (!socket) return;
+  if (!socket || socket.destroyed || job?._transportClosing) return;
+  if (job && typeof job === "object") job._transportClosing = true;
   try { socket.end(); } catch {}
-  try { socket.destroy(); } catch {}
+  setTimeout(() => {
+    if (!socket.destroyed) {
+      try { socket.destroy(); } catch {}
+    }
+  }, 250).unref?.();
 }
 
 async function ensureSession(connection) {
