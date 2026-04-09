@@ -382,6 +382,13 @@ function resolveTaskChat(routeKey) {
     }
   }
 
+  const persistedChatId = getCurrentTaskChatId({ allowPersisted: true });
+  if (routeKey && persistedChatId) {
+    persistChatRoute(routeKey, persistedChatId);
+    log.info(`使用已持久化 chat_id 作为任务通知路由：${routeKey} -> ${persistedChatId}`);
+    return persistedChatId;
+  }
+
   return null;
 }
 
@@ -430,9 +437,10 @@ function backendRequest(method, urlPath, body) {
 
 // ─── 飞书群主动通知 ───────────────────────────────────────────────────────────
 
-function getCurrentTaskChatId() {
+function getCurrentTaskChatId(options = {}) {
+  const allowPersisted = options.allowPersisted === true;
   if (!lastChatId) return null;
-  if (lastChatIdSource === "persisted") return null;
+  if (!allowPersisted && lastChatIdSource === "persisted") return null;
   return lastChatId;
 }
 
