@@ -1443,6 +1443,21 @@ function createHttpServer() {
         return sendJson(res, 200, publicJob);
       }
 
+      if (req.method === "POST" && url.pathname === "/report-analysis/cancel") {
+        const body = await readJsonBody(req);
+        const reportId = typeof body.reportId === "string" ? body.reportId.trim() : "";
+        if (!reportId) return sendJson(res, 400, { error: "reportId is required" });
+        const reportRun = activeReportRun;
+        if (!reportRun || reportRun.reportId !== reportId) {
+          return sendJson(res, 200, { stopped: false });
+        }
+        reportRun.stopRequested = true;
+        try { await reportRun.connection?.cancel({ sessionId: reportRun.sessionId }); } catch {}
+        try { await reportRun.connection?.closeSession({ sessionId: reportRun.sessionId }); } catch {}
+        destroyJobTransport(reportRun);
+        return sendJson(res, 200, { stopped: true });
+      }
+
       return sendJson(res, 404, { error: "not found" });
     } catch (err) {
       return sendJson(res, 500, { error: err?.message || String(err) });
@@ -1468,7 +1483,7 @@ function createHttpServer() {
 
 // ─── 分析任务：临时 ACP Session B ────────────────────────────────────────────
 
-async function runAnalysisSession(localPath) {
+async function runAnalysisSession(localPath, options = {}) {
   log.info(`创建分析 Session B（cwd: ${localPath}）...`);
   let conn2, client2, socket2;
   for (let i = 1; i <= CONFIG.maxRetries; i++) {
@@ -1483,6 +1498,8 @@ async function runAnalysisSession(localPath) {
   log.info(`分析 Session B 已创建：${sid2}`);
 
   const reportRun = {
+    reportId: typeof options.reportId === "string" ? options.reportId.trim() : "",
+    projectId: typeof options.projectId === "string" ? options.projectId.trim() : "",
     localPath,
     connection: conn2,
     client: client2,
@@ -1580,7 +1597,7 @@ async function pollAndProcessReports() {
     let markdown = "", baselineJson = null;
     let status = "COMPLETED";
     try {
-      ({ markdown, baselineJson } = await runAnalysisSession(localPath));
+      ({ markdown, baselineJson } = await runAnalysisSession(localPath, { reportId, projectId }));
     } catch (err) {
       log.error(`分析失败：${err.message}`);
       status = "FAILED";
