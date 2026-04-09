@@ -345,6 +345,13 @@ function resolveTaskChat(routeKey) {
     return normalizedMap[routeKey];
   }
 
+  if (routeKey && routeKey.includes("::")) {
+    const globalRouteKey = routeKey.replace(/::.*$/, "::__global__");
+    if (normalizedMap[globalRouteKey]) {
+      return normalizedMap[globalRouteKey];
+    }
+  }
+
   return null;
 }
 
@@ -402,9 +409,9 @@ function getCurrentTaskChatId() {
 
 function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
-  const markdownText = String(text || "").split(/\r?\n/).filter((line) => line.length > 0).join("\n\n");
+  const plainText = String(text || "").replace(/\r\n/g, "\n").trim();
   try {
-    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--markdown", markdownText || String(text || "")]);
+    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
@@ -1550,26 +1557,84 @@ async function runAnalysisSession(localPath, options = {}) {
 
 let _analysisRunning = false;
 let activeReportRun = null;
+let lastReportPollNotice = "";
+let lastReportPollIdentity = null;
+let lastReportPollIdentityAt = 0;
+
+function logReportPollNotice(level, message) {
+  if (!message || lastReportPollNotice === message) return;
+  lastReportPollNotice = message;
+  const logger = typeof log[level] === "function" ? log[level] : log.info;
+  logger(message);
+}
+
+function clearReportPollNotice() {
+  lastReportPollNotice = "";
+}
+
+async function fetchReportPollIdentity() {
+  const now = Date.now();
+  if (lastReportPollIdentity && now - lastReportPollIdentityAt < 60_000) {
+    return lastReportPollIdentity;
+  }
+
+  try {
+    const res = await backendRequest("GET", "/api/auth/me");
+    if (res.status !== 200) {
+      lastReportPollIdentity = null;
+      lastReportPollIdentityAt = now;
+      return null;
+    }
+    const profile = res.body?.data || res.body;
+    const identity = profile?.userId || profile?.username || profile?.email || null;
+    lastReportPollIdentity = typeof identity === "string" && identity.trim() ? identity.trim() : null;
+    lastReportPollIdentityAt = now;
+    return lastReportPollIdentity;
+  } catch {
+    lastReportPollIdentity = null;
+    lastReportPollIdentityAt = now;
+    return null;
+  }
+}
 
 async function pollAndProcessReports() {
   if (_analysisRunning) return;
   if (!CONFIG.backendToken && !existsSync(BRIDGE_AUTH_FILE)) {
-    // 未配置 token 且 Electron 尚未登录（无共享 cookie 文件），静默跳过
+    logReportPollNotice("warn", "报告轮询跳过：Bridge 尚未拿到后端认证，请确认 Electron 已登录并同步 bridge-auth.txt，或显式配置 SYSBUILDER_TOKEN");
     return;
   }
 
   let pending;
   try {
     const res = await backendRequest("GET", "/api/reports/pending");
-    if (res.status !== 200) return; // 未登录或服务不可达，静默跳过
+    if (res.status !== 200) {
+      logReportPollNotice("warn", `报告轮询跳过：读取 /api/reports/pending 失败（HTTP ${res.status}）`);
+      return;
+    }
     pending = Array.isArray(res.body?.data)
       ? res.body.data
       : Array.isArray(res.body)
         ? res.body
         : [];
-  } catch { return; } // 后端不可达，静默跳过
+  } catch (err) {
+    logReportPollNotice("warn", `报告轮询跳过：后端不可达（${err?.message || String(err)}）`);
+    return;
+  }
 
-  if (!pending.length) return;
+  clearReportPollNotice();
+
+  if (!pending.length) {
+    const identity = await fetchReportPollIdentity();
+    logReportPollNotice(
+      "info",
+      identity
+        ? `报告轮询在线：当前 Bridge 认证用户为 ${identity}，暂未发现该用户的待处理报告`
+        : "报告轮询在线：已连接后端，但暂未发现待处理报告",
+    );
+    return;
+  }
+
+  clearReportPollNotice();
 
   const { reportId, projectId, title, requestContext } = pending[0];
   let ctx = {};
@@ -1580,7 +1645,17 @@ async function pollAndProcessReports() {
     || (typeof ctx.repoUrl === "string" && /^[A-Za-z]:[\\/]/.test(ctx.repoUrl) ? ctx.repoUrl : "");
 
   if (!localPath) {
-    log.warn(`报告 ${reportId} 无 localPath，跳过`);
+    const failMessage = "缺少可用的本地项目路径（localPath）。请在桌面端为项目选择本地路径后重新创建分析任务。";
+    log.warn(`报告 ${reportId} 无 localPath，已标记失败`);
+    try {
+      await backendRequest("PUT", `/api/project/${projectId}/reports/${reportId}`, {
+        status: "FAILED",
+        reportMarkdown: `## 分析未启动\n\n${failMessage}`,
+      });
+    } catch (updateErr) {
+      log.error(`报告 ${reportId} 标记失败时出错：${updateErr?.message || String(updateErr)}`);
+    }
+    notifyLark(`❌ 项目 ${title || projectId} 分析未启动：${failMessage}`, reportNotifyChatId);
     return;
   }
 
@@ -1729,6 +1804,8 @@ async function main() {
       lastChatId = event.chat_id;
       lastChatIdSource = "event";
       persistLastChatId(lastChatId);
+      const senderRouteKey = buildChatRouteKey(event.sender_id, "");
+      if (senderRouteKey) persistChatRoute(senderRouteKey, lastChatId);
     }
 
     const matchedTicket = findTicketForAnswer(msgText);
