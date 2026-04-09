@@ -763,6 +763,15 @@ function buildStoryMapSyncCompletionSummary(job, replyText) {
   ].filter(Boolean).join("\n");
 }
 
+function abortReportRun(reportRun, reason) {
+  if (!reportRun) return false;
+  reportRun.stopRequested = true;
+  if (typeof reportRun.abort === "function") {
+    reportRun.abort(new Error(reason || "报告分析已取消"));
+  }
+  return true;
+}
+
 async function stopAllAnalysisJobs(reason) {
   const jobs = Array.from(analysisJobs.values());
   const waitingIds = Array.from(waitingTickets.keys());
@@ -794,7 +803,7 @@ async function stopAllAnalysisJobs(reason) {
 
   const reportRun = activeReportRun;
   if (reportRun?.connection && reportRun?.sessionId) {
-    reportRun.stopRequested = true;
+    abortReportRun(reportRun, reason);
     try { await reportRun.connection.cancel({ sessionId: reportRun.sessionId }); } catch {}
     try { await reportRun.connection.closeSession({ sessionId: reportRun.sessionId }); } catch {}
     destroyJobTransport(reportRun);
@@ -1492,7 +1501,7 @@ function createHttpServer() {
         if (!reportRun || reportRun.reportId !== reportId) {
           return sendJson(res, 200, { stopped: false });
         }
-        reportRun.stopRequested = true;
+        abortReportRun(reportRun, "已通过删除报告取消当前分析");
         try { await reportRun.connection?.cancel({ sessionId: reportRun.sessionId }); } catch {}
         try { await reportRun.connection?.closeSession({ sessionId: reportRun.sessionId }); } catch {}
         destroyJobTransport(reportRun);
@@ -1547,7 +1556,11 @@ async function runAnalysisSession(localPath, options = {}) {
     socket: socket2,
     sessionId: sid2,
     stopRequested: false,
+    abort: null,
   };
+  reportRun.abortPromise = new Promise((_, reject) => {
+    reportRun.abort = (error) => reject(error || new Error("报告分析已取消"));
+  });
   activeReportRun = reportRun;
 
   const prompt = [
@@ -1562,7 +1575,10 @@ async function runAnalysisSession(localPath, options = {}) {
   ].join("\n");
 
   try {
-    await sendToACP(conn2, client2, sid2, prompt);
+    await Promise.race([
+      sendToACP(conn2, client2, sid2, prompt),
+      reportRun.abortPromise,
+    ]);
   } finally {
     try { await conn2.closeSession({ sessionId: sid2 }); } catch {}
     destroyJobTransport(reportRun);
@@ -1571,7 +1587,7 @@ async function runAnalysisSession(localPath, options = {}) {
   }
 
   if (reportRun.stopRequested) {
-    throw new Error("已被用户通过 !stop 中止");
+    throw new Error("已取消当前报告分析");
   }
 
   // 读取分析输出文件（Agent 已写入项目目录）
