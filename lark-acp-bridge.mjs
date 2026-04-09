@@ -55,6 +55,7 @@ function resolveCommandSpec(command) {
     : [];
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
+    ?? candidates.find((line) => /\.(cmd|bat)$/i.test(line))
     ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
     ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
