@@ -402,20 +402,12 @@ function getCurrentTaskChatId() {
 
 function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
-  const lines = text.split(/\r?\n/).filter((line) => line.length > 0);
-  const contentLines = lines.length > 0
-    ? lines.map((line) => [{ tag: "text", text: line }])
-    : [[{ tag: "text", text }]];
-  const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
-  const tmpFile = join(tmpdir(), `bridge-notify-${Date.now()}.json`);
+  const plainText = String(text || "").split(/\r?\n/).filter((line) => line.length > 0).join("\n");
   try {
-    writeFileSync(tmpFile, postJson, "utf8");
-    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--msg-type", "post", "--content", postJson]);
+    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
-  } finally {
-    try { unlinkSync(tmpFile); } catch {}
   }
 }
 
@@ -733,6 +725,7 @@ function buildStoryMapSyncCompletionSummary(job, replyText) {
 async function stopAllAnalysisJobs(reason) {
   const jobs = Array.from(analysisJobs.values());
   const waitingIds = Array.from(waitingTickets.keys());
+  let stoppedReportRuns = 0;
 
   for (const ticketId of waitingIds) {
     waitingTickets.delete(ticketId);
@@ -758,7 +751,16 @@ async function stopAllAnalysisJobs(reason) {
     });
   }
 
-  return { stoppedJobs: jobs.length, clearedTickets: waitingIds.length };
+  const reportRun = activeReportRun;
+  if (reportRun?.connection && reportRun?.sessionId) {
+    reportRun.stopRequested = true;
+    try { await reportRun.connection.cancel({ sessionId: reportRun.sessionId }); } catch {}
+    try { await reportRun.connection.closeSession({ sessionId: reportRun.sessionId }); } catch {}
+    destroyJobTransport(reportRun);
+    stoppedReportRuns = 1;
+  }
+
+  return { stoppedJobs: jobs.length, clearedTickets: waitingIds.length, stoppedReportRuns };
 }
 
 async function processSessionBReply(job, replyText) {
@@ -1089,6 +1091,12 @@ async function startRefactorAnalysis(projectPath, options = {}) {
       socket: socket2,
       sessionId,
     });
+    if (isJobStopRequested(jobId)) {
+      try { await conn2.cancel({ sessionId }); } catch {}
+      try { await conn2.closeSession({ sessionId }); } catch {}
+      destroyJobTransport({ socket: socket2 });
+      return jobId;
+    }
 
     notifyLark([
       "📝 已开始需求文档分析。",
@@ -1187,6 +1195,12 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
       socket: socket2,
       sessionId,
     });
+    if (isJobStopRequested(jobId)) {
+      try { await conn2.cancel({ sessionId }); } catch {}
+      try { await conn2.closeSession({ sessionId }); } catch {}
+      destroyJobTransport({ socket: socket2 });
+      return jobId;
+    }
 
     notifyLark([
       "🗺️ 已开始 Story Map 同步。",
@@ -1456,9 +1470,9 @@ function createHttpServer() {
 
 async function runAnalysisSession(localPath) {
   log.info(`创建分析 Session B（cwd: ${localPath}）...`);
-  let conn2, client2;
+  let conn2, client2, socket2;
   for (let i = 1; i <= CONFIG.maxRetries; i++) {
-    try { ({ connection: conn2, client: client2 } = await connectToACP()); break; }
+    try { ({ connection: conn2, client: client2, socket: socket2 } = await connectToACP()); break; }
     catch (err) {
       if (i === CONFIG.maxRetries) throw new Error(`Session B 连接失败：${err.message}`);
       await sleep(2000);
@@ -1468,24 +1482,38 @@ async function runAnalysisSession(localPath) {
   const { sessionId: sid2 } = await conn2.newSession({ cwd: localPath, mcpServers: [] });
   log.info(`分析 Session B 已创建：${sid2}`);
 
+  const reportRun = {
+    localPath,
+    connection: conn2,
+    client: client2,
+    socket: socket2,
+    sessionId: sid2,
+    stopRequested: false,
+  };
+  activeReportRun = reportRun;
+
   const prompt = [
-    "请直接对当前项目源码做完整分析，不要依赖必须预装的自定义 skill。",
-    "如果当前环境里刚好有相关分析 skill 可以自行使用；如果没有，就直接基于代码、配置和目录结构完成分析。",
+    "请调用 carpm-analyzer 对当前项目进行完整 CARPM 分析。",
+    "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
     "",
     "输出要求：",
     "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
     "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
-    "3. Markdown 报告至少包含：项目概览、技术栈、核心模块、主要调用链/数据流、高风险热点、歧义点、重构建议。",
-    "4. JSON 基线至少包含：project, techStack, modules, entrypoints, risks, ambiguities 字段。",
-    "5. 全程使用中文。",
-    "6. 全部完成后再回复：CARPM 分析完成。",
+    "3. 全程使用中文。",
+    "4. 全部完成后再回复：CARPM 分析完成。",
   ].join("\n");
 
   try {
     await sendToACP(conn2, client2, sid2, prompt);
   } finally {
     try { await conn2.closeSession({ sessionId: sid2 }); } catch {}
+    destroyJobTransport(reportRun);
+    if (activeReportRun === reportRun) activeReportRun = null;
     log.info(`分析 Session B 已关闭：${sid2}`);
+  }
+
+  if (reportRun.stopRequested) {
+    throw new Error("已被用户通过 !stop 中止");
   }
 
   // 读取分析输出文件（Agent 已写入项目目录）
@@ -1504,6 +1532,7 @@ async function runAnalysisSession(localPath) {
 // ─── 报告轮询 & 处理 ──────────────────────────────────────────────────────────
 
 let _analysisRunning = false;
+let activeReportRun = null;
 
 async function pollAndProcessReports() {
   if (_analysisRunning) return;
@@ -1708,21 +1737,12 @@ async function main() {
 
     if (msgText === CMD_STATUS) {
       const lines = _logBuffer.slice(-10);
-      // 构造 post 格式 JSON，每行独立段落，避免 md tag 把 \n 渲染成字面量 <br>
-      const contentLines = [
-        [{ tag: "text", text: "📋 Bridge 最近日志：" }],
-        ...lines.map(l => [{ tag: "text", text: l }]),
-      ];
-      const postJson = JSON.stringify({ zh_cn: { content: contentLines } });
-      const tmpFile = join(tmpdir(), `bridge-status-${Date.now()}.json`);
+      const statusText = ["📋 Bridge 最近日志：", ...lines].join("\n");
       try {
-        writeFileSync(tmpFile, postJson, "utf8");
-        execLarkCli(["im", "+messages-reply", "--message-id", event.message_id, "--msg-type", "post", "--content", postJson]);
+        execLarkCli(["im", "+messages-reply", "--message-id", event.message_id, "--text", statusText]);
         log.info(`!status 已回复`);
       } catch (e) {
         log.error(`!status 回复失败：${e.message}`);
-      } finally {
-        try { unlinkSync(tmpFile); } catch {}
       }
       return;
     }
@@ -1730,7 +1750,7 @@ async function main() {
     if (msgText === CMD_STOP) {
       queue.clear();
       const reason = "已被用户通过 !stop 中止";
-      const { stoppedJobs, clearedTickets } = await stopAllAnalysisJobs(reason);
+      const { stoppedJobs, clearedTickets, stoppedReportRuns } = await stopAllAnalysisJobs(reason);
       try {
         await connection.cancel({ sessionId });
         log.info(`!stop：已发送 cancel 信令到主 ACP 会话`);
@@ -1742,7 +1762,7 @@ async function main() {
           "--message-id",
           event.message_id,
           "--text",
-          `🛑 已中止所有会话：主会话已取消，分析会话 ${stoppedJobs} 个，清理待答复问题 ${clearedTickets} 个`,
+          `🛑 已中止所有会话：主会话已取消，任务会话 ${stoppedJobs} 个，报告会话 ${stoppedReportRuns} 个，清理待答复问题 ${clearedTickets} 个`,
         ]);
       } catch (e) { log.error(`!stop 回复失败：${e.message}`); }
       return;
