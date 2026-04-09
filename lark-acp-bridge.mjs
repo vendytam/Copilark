@@ -46,6 +46,11 @@ const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
 const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
+function readEnvPath(name) {
+  const value = typeof process.env[name] === "string" ? process.env[name].trim() : "";
+  return value && existsSync(value) ? value : null;
+}
+
 function findFirstExisting(paths) {
   return paths.find((filePath) => filePath && existsSync(filePath)) || null;
 }
@@ -158,6 +163,26 @@ function resolveLarkCliJsPath(candidates) {
 }
 
 function resolveCommandSpec(command) {
+  if (command === "lark-cli" && process.platform === "win32") {
+    const forcedCliPath = readEnvPath("LARK_CLI_PATH");
+    const forcedCliJsPath = readEnvPath("LARK_CLI_JS_PATH");
+    const forcedNodePath = readEnvPath("LARK_NODE_PATH") || findCommandPath("node");
+    if (forcedCliJsPath && forcedNodePath) {
+      return {
+        path: forcedNodePath,
+        argsPrefix: [forcedCliJsPath],
+        useShell: false,
+      };
+    }
+    if (forcedCliPath) {
+      return {
+        path: forcedCliPath,
+        argsPrefix: [],
+        useShell: /\.(cmd|bat)$/i.test(forcedCliPath),
+      };
+    }
+  }
+
   const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
   if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
   const matches = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);

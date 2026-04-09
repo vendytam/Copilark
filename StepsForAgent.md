@@ -38,6 +38,24 @@ Test-Path ((npm root -g) + '\@larksuite\cli\bin\lark-cli.js')
 
 请优先重装为默认 Node/npm 全局路径，再继续后续步骤。
 
+如果暂时无法重装，也可以在启动 Bridge 前**强制指定执行入口**：
+
+```powershell
+$env:LARK_NODE_PATH="D:\Program Files\nodejs\node.exe"
+$env:LARK_CLI_JS_PATH="C:\Users\<你>\AppData\Roaming\npm\node_modules\@larksuite\cli\bin\lark-cli.js"
+```
+
+或直接指定 exe：
+
+```powershell
+$env:LARK_CLI_PATH="C:\Users\<你>\AppData\Roaming\npm\node_modules\@larksuite\cli\bin\lark-cli.exe"
+```
+
+优先级说明：
+1. `LARK_CLI_JS_PATH + LARK_NODE_PATH`
+2. `LARK_CLI_PATH`
+3. 自动探测（最后才会退回 `.cmd + shell=true`）
+
 #第 2 步 — 配置应用凭证
 在后台运行此命令，命令会输出一个授权链接，提取该链接并发送给用户，用户在浏览器中完成配置后命令会自动退出。
 lark-cli config init --new

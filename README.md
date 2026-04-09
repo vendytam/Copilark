@@ -89,6 +89,27 @@ Test-Path ((npm root -g) + '\@larksuite\cli\bin\lark-cli.js')
 
 如果 `where lark-cli` 只返回 `.cmd`，且找不到 `lark-cli.js`，请优先修正 Node/npm 的全局安装布局，再继续配置 Copilark。
 
+如果短期内不能调整安装布局，Bridge 也支持**显式强制入口**：
+
+```powershell
+$env:LARK_NODE_PATH="D:\Program Files\nodejs\node.exe"
+$env:LARK_CLI_JS_PATH="C:\Users\<你>\AppData\Roaming\npm\node_modules\@larksuite\cli\bin\lark-cli.js"
+```
+
+或：
+
+```powershell
+$env:LARK_CLI_PATH="C:\Users\<你>\AppData\Roaming\npm\node_modules\@larksuite\cli\bin\lark-cli.exe"
+```
+
+Bridge 的优先级是：
+
+1. `LARK_CLI_JS_PATH + LARK_NODE_PATH`
+2. `LARK_CLI_PATH`
+3. 自动探测
+
+只有前两者都缺失或无效时，才会退回 `.cmd + shell=true`。
+
 ## 飞书平台配置（必须）
 
 在 [飞书开放平台控制台](https://open.feishu.cn/) 完成：
