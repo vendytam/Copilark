@@ -90,6 +90,18 @@ function parseCliShimJsPath(shimPath) {
   }
 }
 
+function resolvePortableNodePath(candidates) {
+  const directCandidates = [findCommandPath("node")];
+  for (const line of candidates) {
+    const lineDir = dirname(line);
+    directCandidates.push(
+      join(lineDir, "node.exe"),
+      join(lineDir, "..", "node.exe")
+    );
+  }
+  return findFirstExisting([...new Set(directCandidates)]);
+}
+
 function resolveLarkCliJsPath(candidates) {
   const directCandidates = [];
   for (const line of candidates) {
@@ -98,7 +110,12 @@ function resolveLarkCliJsPath(candidates) {
       continue;
     }
     if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
-      directCandidates.push(join(dirname(line), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"));
+      const lineDir = dirname(line);
+      directCandidates.push(
+        join(lineDir, "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"),
+        join(lineDir, "lib", "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"),
+        join(lineDir, "..", "lib", "node_modules", "@larksuite", "cli", "bin", "lark-cli.js")
+      );
       const shimJsPath = parseCliShimJsPath(line);
       if (shimJsPath) directCandidates.push(shimJsPath);
     }
@@ -129,7 +146,7 @@ function resolveCommandSpec(command) {
     : [];
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   if (command === "lark-cli" && process.platform === "win32") {
-    const nodePath = findCommandPath("node");
+    const nodePath = resolvePortableNodePath(candidates);
     const cliJsPath = resolveLarkCliJsPath(candidates);
     if (nodePath && cliJsPath) {
       return {
@@ -145,7 +162,7 @@ function resolveCommandSpec(command) {
     ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
   if (/\.(cmd|bat)$/i.test(resolved)) {
-    const nodePath = findCommandPath("node");
+    const nodePath = resolvePortableNodePath([resolved]);
     const cliJsPath = resolveLarkCliJsPath([resolved]);
     if (nodePath && cliJsPath) {
       return {
