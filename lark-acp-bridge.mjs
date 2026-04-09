@@ -46,6 +46,75 @@ const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
 const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
+function findFirstExisting(paths) {
+  return paths.find((filePath) => filePath && existsSync(filePath)) || null;
+}
+
+function findCommandPath(command) {
+  const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0) return null;
+  return result.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || null;
+}
+
+function readGlobalNpmRoots() {
+  const roots = [];
+  for (const args of [["root", "-g"], ["prefix", "-g"]]) {
+    const result = spawnSync("npm", args, { encoding: "utf8", windowsHide: true });
+    if (result.status !== 0) continue;
+    const value = (result.stdout || "").trim();
+    if (!value) continue;
+    roots.push(
+      args[0] === "prefix"
+        ? join(value, "node_modules")
+        : value
+    );
+  }
+  return [...new Set(roots)];
+}
+
+function parseCliShimJsPath(shimPath) {
+  if (!/\.(cmd|bat)$/i.test(shimPath)) return null;
+  try {
+    const raw = readFileSync(shimPath, "utf8");
+    const normalized = raw.replace(/\r/g, "");
+    const quotedMatch = normalized.match(/"([^"\r\n]*lark-cli\.js)"/i);
+    const looseMatch = quotedMatch || normalized.match(/([^\s"\r\n]*lark-cli\.js)/i);
+    if (!looseMatch?.[1]) return null;
+    let candidate = looseMatch[1].replace(/%~dp0/gi, "").replace(/\//g, "\\");
+    if (!/^[A-Za-z]:\\/.test(candidate) && !candidate.startsWith("\\\\")) {
+      candidate = join(dirname(shimPath), candidate);
+    }
+    return existsSync(candidate) ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveLarkCliJsPath(candidates) {
+  const directCandidates = [];
+  for (const line of candidates) {
+    if (/lark-cli\.js$/i.test(line)) {
+      directCandidates.push(line);
+      continue;
+    }
+    if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
+      directCandidates.push(join(dirname(line), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js"));
+      const shimJsPath = parseCliShimJsPath(line);
+      if (shimJsPath) directCandidates.push(shimJsPath);
+    }
+  }
+
+  for (const npmRoot of readGlobalNpmRoots()) {
+    directCandidates.push(join(npmRoot, "@larksuite", "cli", "bin", "lark-cli.js"));
+  }
+
+  directCandidates.push(
+    join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.js")
+  );
+
+  return findFirstExisting([...new Set(directCandidates)]);
+}
+
 function resolveCommandSpec(command) {
   const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
   if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
@@ -60,19 +129,8 @@ function resolveCommandSpec(command) {
     : [];
   const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   if (command === "lark-cli" && process.platform === "win32") {
-    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
-    const nodePath = nodePathResult.status === 0
-      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
-      : null;
-    const cliJsPath = candidates
-      .map((line) => {
-        if (/lark-cli\.js$/i.test(line)) return line;
-        if (/\.(cmd|bat)$/i.test(line) || /lark-cli$/i.test(line)) {
-          return join(dirname(line), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
-        }
-        return null;
-      })
-      .find((line) => line && existsSync(line));
+    const nodePath = findCommandPath("node");
+    const cliJsPath = resolveLarkCliJsPath(candidates);
     if (nodePath && cliJsPath) {
       return {
         path: nodePath,
@@ -87,12 +145,9 @@ function resolveCommandSpec(command) {
     ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
   if (/\.(cmd|bat)$/i.test(resolved)) {
-    const nodePathResult = spawnSync("where.exe", ["node"], { encoding: "utf8", windowsHide: true });
-    const nodePath = nodePathResult.status === 0
-      ? nodePathResult.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean)
-      : null;
-    const cliJsPath = join(dirname(resolved), "node_modules", "@larksuite", "cli", "bin", "lark-cli.js");
-    if (nodePath && existsSync(cliJsPath)) {
+    const nodePath = findCommandPath("node");
+    const cliJsPath = resolveLarkCliJsPath([resolved]);
+    if (nodePath && cliJsPath) {
       return {
         path: nodePath,
         argsPrefix: [cliJsPath],
@@ -318,12 +373,28 @@ function bufferLog(line) {
   if (_logBuffer.length > LOG_BUFFER_SIZE) _logBuffer.shift();
 }
 
+function stringifyLogArg(value) {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.stack || value.message;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function formatLogLine(level, args) {
+  const text = args.map(stringifyLogArg).join(" ").replace(/^\[Bridge\]\s*/i, "");
+  const time = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  return `[${time}][Bridge][${level}] ${text}`;
+}
+
 // 在打印 log 前确保换行（避免与流式输出混排）
 const log = {
-  info:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][INFO]  ${a.join(" ")}`; bufferLog(l); console.log(l); },
-  warn:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][WARN]  ${a.join(" ")}`; bufferLog(l); console.warn(l); },
-  error: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][ERROR] ${a.join(" ")}`; bufferLog(l); console.error(l); },
-  event: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = `[Bridge][EVENT] ${a.join(" ")}`; bufferLog(l); console.log(l); },
+  info:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = formatLogLine("INFO", a); bufferLog(l); console.log(l); },
+  warn:  (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = formatLogLine("WARN", a); bufferLog(l); console.warn(l); },
+  error: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = formatLogLine("ERROR", a); bufferLog(l); console.error(l); },
+  event: (...a) => { if (_streaming) { process.stdout.write("\x1b[0m\n"); _streaming = false; } const l = formatLogLine("EVENT", a); bufferLog(l); console.log(l); },
 };
 
 const originalConsoleError = console.error.bind(console);
