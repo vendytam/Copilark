@@ -46,25 +46,42 @@ const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
 const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
-function resolveCommandPath(command) {
+function resolveCommandSpec(command) {
   const result = spawnSync("where.exe", [command], { encoding: "utf8", windowsHide: true });
   if (result.status !== 0) throw new Error(`无法定位命令：${command}`);
   const matches = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const extraCandidates = command === "lark-cli" && process.platform === "win32"
     ? [join(process.env.APPDATA || "", "npm", "node_modules", "@larksuite", "cli", "bin", "lark-cli.exe")]
     : [];
-  const candidates = [...matches, ...extraCandidates].filter(Boolean);
+  const candidates = [...matches, ...extraCandidates].filter((line) => line && existsSync(line));
   const resolved = candidates.find((line) => line.toLowerCase().endsWith(".exe"))
     ?? candidates.find((line) => !/\.(cmd|bat)$/i.test(line))
-    ?? matches[0];
+    ?? candidates[0];
   if (!resolved) throw new Error(`无法定位命令：${command}`);
-  return resolved;
+  return {
+    path: resolved,
+    useShell: /\.(cmd|bat)$/i.test(resolved),
+  };
 }
 
-const LARK_CLI_PATH = process.platform === "win32" ? resolveCommandPath("lark-cli") : "lark-cli";
+const LARK_CLI = process.platform === "win32"
+  ? resolveCommandSpec("lark-cli")
+  : { path: "lark-cli", useShell: false };
 
 function execLarkCli(args) {
-  return execFileSync(LARK_CLI_PATH, args.map((arg) => String(arg)), {
+  const normalizedArgs = args.map((arg) => String(arg));
+  if (LARK_CLI.useShell) {
+    const result = spawnSync(LARK_CLI.path, normalizedArgs, {
+      encoding: "utf8",
+      windowsHide: true,
+      shell: true,
+    });
+    if (result.status !== 0) {
+      throw new Error((result.stderr || result.stdout || "").toString().trim() || `lark-cli 执行失败，退出码=${result.status}`);
+    }
+    return (result.stdout || "").toString();
+  }
+  return execFileSync(LARK_CLI.path, normalizedArgs, {
     encoding: "utf8",
     windowsHide: true,
   });
@@ -1536,9 +1553,9 @@ async function pollAndProcessReports() {
 function subscribeLarkEvents(onEvent) {
   log.info("启动飞书事件订阅...");
   const proc = spawn(
-    LARK_CLI_PATH,
+    LARK_CLI.path,
     ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
-    { stdio: ["ignore", "pipe", "pipe"], shell: false, windowsHide: true }
+    { stdio: ["ignore", "pipe", "pipe"], shell: LARK_CLI.useShell, windowsHide: true }
   );
 
   let buffer = "";
