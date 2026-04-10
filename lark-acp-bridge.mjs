@@ -1102,23 +1102,40 @@ function buildStoryMapPrompt(projectPath, projectId, refactorFiles, promptOverri
   });
 }
 
-function buildDefaultCarpmPrompt() {
+function getCapmOutputPaths(localPath) {
+  const outputDir = join(localPath, "sysbuilder", "capm-output");
+  return {
+    outputDir,
+    reportPath: join(outputDir, "capm-report.md"),
+    baselinePath: join(outputDir, "capm-baseline.json"),
+  };
+}
+
+function buildDefaultCapmPrompt() {
+  const paths = getCapmOutputPaths(".");
   return [
-    "请调用 carpm-analyzer 对当前项目进行完整 CARPM 分析。",
+    "请调用 capm-analysis 对当前项目进行完整 CAPM 分析。",
     "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
     "",
     "输出要求：",
-    "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
-    "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
+    `1. 将 Markdown 报告保存到 ${paths.reportPath.replace(/\\/g, "/")}。`,
+    `2. 将 JSON 基线保存到 ${paths.baselinePath.replace(/\\/g, "/")}。`,
     "3. 全程使用中文。",
-    "4. 全部完成后再回复：CARPM 分析完成。",
+    "4. 全部完成后再回复：CAPM 分析完成。",
   ].join("\n");
 }
 
-function buildCarpmPrompt(localPath, promptOverride) {
+function buildCapmPrompt(localPath, reportId, promptOverride) {
   const override = normalizePromptOverride(promptOverride);
-  if (!override) return buildDefaultCarpmPrompt();
-  return renderPromptTemplate(override, { projectPath: localPath });
+  const paths = getCapmOutputPaths(localPath);
+  if (!override) return buildDefaultCapmPrompt();
+  return renderPromptTemplate(override, {
+    projectPath: localPath,
+    reportId: typeof reportId === "string" ? reportId.trim() : "",
+    capmOutputDir: paths.outputDir.replace(/\\/g, "/"),
+    capmReportPath: paths.reportPath.replace(/\\/g, "/"),
+    capmBaselinePath: paths.baselinePath.replace(/\\/g, "/"),
+  });
 }
 
 function isJobStopRequested(jobId) {
@@ -2005,11 +2022,11 @@ async function runAnalysisSession(localPath, options = {}) {
   });
   activeReportRun = reportRun;
 
-  const prompt = buildCarpmPrompt(localPath, options.promptOverride);
+  const prompt = buildCapmPrompt(localPath, reportRun.reportId, options.promptOverride);
 
   try {
     updateReportRun(reportRun, { status: "running" });
-    appendReportLiveLog(reportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已启动 CARPM 分析会话\n`);
+    appendReportLiveLog(reportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已启动 CAPM 分析会话\n`);
     await Promise.race([
       sendToACP(conn2, client2, sid2, prompt, (chunk) => appendReportLiveLog(reportRun, chunk)),
       reportRun.abortPromise,
@@ -2026,8 +2043,7 @@ async function runAnalysisSession(localPath, options = {}) {
   }
 
   // 读取分析输出文件（Agent 已写入项目目录）
-  const reportPath   = join(localPath, "docs", "carpm-output", "carpm-report.md");
-  const baselinePath = join(localPath, "docs", "carpm-output", "carpm-baseline.json");
+  const { reportPath, baselinePath } = getCapmOutputPaths(localPath);
 
   const markdown    = existsSync(reportPath)   ? readFileSync(reportPath,   "utf8") : null;
   const baselineJson = existsSync(baselinePath) ? readFileSync(baselinePath, "utf8") : null;
