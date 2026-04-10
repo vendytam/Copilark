@@ -901,26 +901,51 @@ function parseNeedUserInput(text) {
   if (!match) return null;
 
   const block = match[1].trim();
-  const lines = block.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const lines = block.split(/\r?\n/);
   const parsed = { question: "", context: "", kind: "", options: [] };
-  let collectingOptions = false;
+  let currentField = null;
+
+  const flushField = (field, buffer) => {
+    const value = buffer.join("\n").trim();
+    if (!field || !value) return;
+    if (field === "options") {
+      parsed.options.push(...value
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("-"))
+        .map((line) => line.slice(1).trim())
+        .filter(Boolean));
+      return;
+    }
+    parsed[field] = value;
+  };
+
+  let buffer = [];
 
   for (const line of lines) {
-    if (line.startsWith("question:")) {
-      parsed.question = line.slice("question:".length).trim();
-      collectingOptions = false;
-    } else if (line.startsWith("context:")) {
-      parsed.context = line.slice("context:".length).trim();
-      collectingOptions = false;
-    } else if (line.startsWith("kind:")) {
-      parsed.kind = line.slice("kind:".length).trim();
-      collectingOptions = false;
-    } else if (line.startsWith("suggested_options:")) {
-      collectingOptions = true;
-    } else if (collectingOptions && line.startsWith("-")) {
-      parsed.options.push(line.slice(1).trim());
+    const trimmed = line.trim();
+    if (trimmed.startsWith("question:")) {
+      flushField(currentField, buffer);
+      currentField = "question";
+      buffer = [trimmed.slice("question:".length).trim()];
+    } else if (trimmed.startsWith("context:")) {
+      flushField(currentField, buffer);
+      currentField = "context";
+      buffer = [trimmed.slice("context:".length).trim()];
+    } else if (trimmed.startsWith("kind:")) {
+      flushField(currentField, buffer);
+      currentField = "kind";
+      buffer = [trimmed.slice("kind:".length).trim()];
+    } else if (trimmed.startsWith("suggested_options:")) {
+      flushField(currentField, buffer);
+      currentField = "options";
+      buffer = [];
+    } else if (currentField) {
+      buffer.push(currentField === "options" ? trimmed : line);
     }
   }
+
+  flushField(currentField, buffer);
 
   return parsed.question ? parsed : null;
 }
@@ -977,13 +1002,13 @@ function buildDefaultRefactorPrompt(projectPath, docsFiles) {
     "请调用 refactor-planner 技能，对当前项目进行重构分析与迭代规划。",
     "要求：",
     "1. 当前工作目录就是项目根目录，请同时分析整个项目代码。",
-    "2. 只分析 docs/ 目录根下的需求文档与规格文档，不要读取 docs 的子目录。",
-    `3. 当前可见的 docs 根目录 Markdown 文件有：${docsFiles.length ? docsFiles.join("、") : "（无）"}`,
+    "2. 只分析 sysbuilder/ 目录根下的需求文档与规格文档，不要读取 sysbuilder 的子目录。",
+    `3. 当前可见的 sysbuilder 根目录 Markdown 文件有：${docsFiles.length ? docsFiles.join("、") : "（无）"}`,
     "4. 如果你不确定这些文件里哪些才属于需求/规格文档，先按 NEED_USER_INPUT 协议通过飞书向用户确认，不要自行扩大范围。",
     "5. 结合已确认的需求/规格文档和现有项目实现，生成迭代计划与重构报告。",
-    "6. 输出结果保存到 docs/refactor/ 目录下，至少包含：",
-    "   - docs/refactor/00-总览.md",
-    "   - docs/refactor/01-*.md",
+    "6. 输出结果保存到 sysbuilder/refactor/ 目录下，至少包含：",
+    "   - sysbuilder/refactor/00-总览.md",
+    "   - sysbuilder/refactor/01-*.md",
     "7. 全程使用中文。",
     "8. 如果在分析过程中遇到任何无法确认的问题，不要自行假设，请按 NEED_USER_INPUT 协议输出问题。",
     "",
@@ -1013,35 +1038,44 @@ function buildRefactorPrompt(projectPath, docsFiles, promptOverride) {
 function buildDefaultStoryMapPrompt(projectPath, projectId, refactorFiles) {
   return [
     "你现在要执行“需求分析结果同步到 Story Map”的任务。",
-    "目标：读取 docs/refactor/ 下的迭代文档，对比 sysbuilder 中当前项目的 Story Map，把明确全新的项新增进去；对完全重复的项跳过；对相近但不完全重复或归属不明确的项，必须先提问确认。",
+    "目标：读取 sysbuilder/refactor/ 下的迭代文档，对比 sysbuilder 中当前项目的 Story Map，把明确全新的项新增进去；对完全重复的项跳过；对相近但不完全重复或归属不明确的项，必须先提问确认。",
     "",
     "当前上下文：",
     `- 项目根目录：${projectPath}`,
     `- 项目 ID：${projectId}`,
-    `- docs/refactor/ 下当前可见的 Markdown 文件：${refactorFiles.length ? refactorFiles.join("、") : "（无）"}`,
+    `- sysbuilder/refactor/ 下当前可见的 Markdown 文件：${refactorFiles.length ? refactorFiles.join("、") : "（无）"}`,
     "",
     "你必须使用当前已注入的 sysbuilder MCP，并按下面顺序执行：",
-    "1. 先读取本地 docs/refactor/00-总览.md，并按需继续读取 docs/refactor/ 下其他迭代文档，提取候选的 Activity / Epic / Story。",
-    `2. 调用 sysbuilder MCP 工具 get_project_context，参数 projectId='${projectId}'，先理解项目上下文。`,
-    `3. 调用 sysbuilder MCP 工具 load_story_map，参数 projectId='${projectId}'，读取当前 Story Map。`,
-    "4. 先在候选项内部去重，再与现有 Story Map 对比，把候选项严格分成三类：完全重复、相近待确认、明确全新。",
-    "5. 只对“明确全新且父级归属明确”的项执行新增，不要改写、合并、删除已有项。",
+    `1. 先调用 sysbuilder MCP 工具 get_project_context，参数 projectId='${projectId}'，读取项目上下文与 Sprint 列表。`,
+    `2. 再调用 sysbuilder MCP 工具 load_story_map，参数 projectId='${projectId}'，读取当前 Story Map。`,
+    "3. 再读取本地 sysbuilder/refactor/00-总览.md，并按需继续读取 sysbuilder/refactor/ 下其他迭代文档，提取候选的 Activity / Epic / Story。",
+    "4. 对每个候选 Story，先整理出：brief、完整 description、所属 Activity/Epic、建议 Sprint、来源文档依据。",
+    "5. 先在候选项内部去重，再与现有 Story Map 对比，把候选项严格分成三类：完全重复、相近待确认、明确全新。",
+    "6. 只对“明确全新且父级归属明确”的项执行新增，不要改写、合并、删除已有项。",
     "",
     "sysbuilder MCP 工具使用要求：",
     `- 新增 Activity 时，调用 create_activity，参数至少包含 projectId='${projectId}'、activityName、description（可选）、createdBy='mcp'。`,
     `- 新增 Epic 时，调用 create_epic，参数至少包含 activityId、epicName、createdBy='mcp'，并附 projectId='${projectId}'。`,
-    "- 新增 Story 时，调用 create_story，参数至少包含 epicId、brief、description（可选）；默认 state='TODO'，workType='USER_STORY'，除非文档明确表明它是技术故事。",
-    "- 不要调用 edit_story、update_story_status 去修改已有项，第一版只允许新增明确全新的项。",
+    "- 新增 Story 时，调用 create_story 必须直接传入非空的完整 description，至少包含：用户目标、核心流程/范围、关键约束或补充说明、来源依据；不要只写标题或一句空泛描述。",
+    "- 如果项目当前一个 Sprint 都没有，必须先调用 create_sprint 为该项目创建 Sprint，再创建 Story；不要因为“没有 Sprint”就把 Story 全部放进 backlog。",
+    "- create_sprint 时优先根据 sysbuilder/refactor 的迭代章节、阶段目标、里程碑来决定 Sprint 数量与命名；如果文档只体现单一阶段，就创建一个默认 Sprint。",
+    "- create_sprint 后，create_story 必须填写新建 Sprint 或匹配 Sprint 的 sprintId；不要默认留空放入 backlog。",
+    "- 只有在 sysbuilder/refactor 与现有 Sprint 信息都不足以判断归属、且确实不适合立即建 Sprint 时，才允许暂不填写 sprintId；如果多个 Sprint 都可能匹配，必须先提问确认。",
+    "- 新增 Story 时，workType 固定使用 TICKET，不要使用 USER_STORY / TECH_STORY / BUG。",
+    "- 不要调用 edit_story 去修改已有 Story，也不要把它当作新建 Story 的默认补救步骤。",
+    "- 不要调用 update_story_status 去修改已有项状态。",
     "",
     "判定规则：",
     "- 完全重复：标题、意图、范围都已被现有 Story Map 覆盖，直接跳过。",
     "- 相近待确认：语义接近但不完全等同，或可能是现有项的拆分/扩展/重命名，必须提问。",
     "- 明确全新：现有 Story Map 中没有覆盖，且父级归属明确，可以直接新增。",
+    "- Sprint 归类：优先依据 sysbuilder/refactor 中的迭代边界、阶段目标、依赖前后关系，以及 get_project_context 返回的 sprintName/goal/已有 stories 做匹配；若现有 Sprint 为空，则先创建再归类。",
     "",
     "禁止事项：",
     "- 不要尝试安装任何本地依赖。",
     "- 不要尝试从本地源码目录手工启动新的 sysbuilder MCP。",
     "- 不要绕过当前已注入的 sysbuilder MCP 去构造临时 client。",
+    "- 不要创建“只有 brief 没有 description”的 Story。",
     "",
     "如果你有任何无法确认的问题，必须按下面协议只输出一个问题块，不要混入其他总结：",
     "<<<NEED_USER_INPUT>>>",
@@ -1054,7 +1088,7 @@ function buildDefaultStoryMapPrompt(projectPath, projectId, refactorFiles) {
     "<<<END_NEED_USER_INPUT>>>",
     "",
     "在收到用户回答后，请继续同步。",
-    "最终完成时请用中文给出简短结果总结，至少说明：新增了多少个 Activity、多少个 Epic、多少个 Story，跳过了多少个重复项，是否还有待确认项。",
+    "最终完成时请用中文给出简短结果总结，至少说明：新增了多少个 Sprint、多少个 Activity、多少个 Epic、多少个 Story，哪些 Story 已归入 Sprint、哪些仍在 backlog，跳过了多少个重复项，是否还有待确认项。",
   ].join("\n");
 }
 
@@ -1108,7 +1142,7 @@ function detectFatalExecutionError(text) {
 }
 
 function ensureRefactorOutputs(projectPath) {
-  const refactorDir = join(projectPath, "docs", "refactor");
+  const refactorDir = join(projectPath, "sysbuilder", "refactor");
   const overviewPath = join(refactorDir, "00-总览.md");
   return {
     refactorDir,
@@ -1118,7 +1152,7 @@ function ensureRefactorOutputs(projectPath) {
 }
 
 function listTopLevelDocsMarkdown(projectPath) {
-  const docsDir = join(projectPath, "docs");
+  const docsDir = join(projectPath, "sysbuilder");
   if (!existsSync(docsDir)) return [];
   return readdirSync(docsDir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
@@ -1126,7 +1160,7 @@ function listTopLevelDocsMarkdown(projectPath) {
 }
 
 function buildRefactorCompletionSummary(projectPath) {
-  const refactorDir = join(projectPath, "docs", "refactor");
+  const refactorDir = join(projectPath, "sysbuilder", "refactor");
   const files = existsSync(refactorDir)
     ? readdirSync(refactorDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
@@ -1144,7 +1178,7 @@ function buildRefactorCompletionSummary(projectPath) {
 }
 
 function listRefactorMarkdown(projectPath) {
-  const refactorDir = join(projectPath, "docs", "refactor");
+  const refactorDir = join(projectPath, "sysbuilder", "refactor");
   if (!existsSync(refactorDir)) return [];
   return readdirSync(refactorDir, { withFileTypes: true })
     .filter((entry) => entry.isFile() && /\.md$/i.test(entry.name))
@@ -1311,10 +1345,10 @@ async function processSessionBReply(job, replyText) {
         `当前仍未检测到输出文件：${outputs.overviewPath}`,
         "",
         "请不要只给口头总结，而是立即把重构分析结果真正写入项目文件：",
-        "1. 创建 docs/refactor/ 目录（如果还不存在）",
-        "2. 写入 docs/refactor/00-总览.md",
-        "3. 再写入至少一个 docs/refactor/01-*.md 迭代报告",
-        "4. 写完后再回复我“已写入 docs/refactor/00-总览.md”",
+        "1. 创建 sysbuilder/refactor/ 目录（如果还不存在）",
+        "2. 写入 sysbuilder/refactor/00-总览.md",
+        "3. 再写入至少一个 sysbuilder/refactor/01-*.md 迭代报告",
+        "4. 写完后再回复我“已写入 sysbuilder/refactor/00-总览.md”",
         "",
         "如果你缺少信息，请按 NEED_USER_INPUT 协议继续提问。",
       ].join("\n");
@@ -1587,7 +1621,7 @@ async function startRefactorAnalysis(projectPath, options = {}) {
     notifyLark([
       "📝 已开始需求文档分析。",
       `项目目录：${projectPath}`,
-      "接下来将调用 refactor-planner 分析 docs/ 下的需求/规格文档，并结合整个项目生成 docs/refactor/ 迭代计划。",
+      "接下来将调用 refactor-planner 分析 sysbuilder/ 下的需求/规格文档，并结合整个项目生成 sysbuilder/refactor/ 迭代计划。",
       "如果过程中有疑问，我会继续在群里提问；届时请把你的回复内容直接当作该问题的答案。",
     ].join("\n"), notifyChatId);
 
@@ -1685,7 +1719,7 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
       "🗺️ 已开始 Story Map 同步。",
       `项目目录：${projectPath}`,
       projectId ? `项目 ID：${projectId}` : null,
-      "接下来将读取 docs/refactor/ 迭代文档、调用 sysbuilder MCP 读取现有 Story Map，并把明确全新的项补入 Story Map。",
+      "接下来将读取 sysbuilder/refactor/ 迭代文档、调用 sysbuilder MCP 读取现有 Story Map，并把明确全新的项补入 Story Map。",
       "如果过程中存在相近但无法自动判定的项，我会继续在群里提问确认。",
     ].filter(Boolean).join("\n"), notifyChatId);
 
@@ -1741,7 +1775,7 @@ async function resumeRefactorAnalysis(ticket, answerText) {
     "用户的回答是：",
     answerText,
     "",
-    "请基于该回答继续分析，并继续输出到 docs/refactor/。",
+    "请基于该回答继续分析，并继续输出到 sysbuilder/refactor/。",
     "如果还有疑问，请继续按 NEED_USER_INPUT 协议输出。",
   ].join("\n");
 
