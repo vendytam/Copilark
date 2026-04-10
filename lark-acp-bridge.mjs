@@ -961,6 +961,132 @@ function appendJobLiveLog(jobId, chunk) {
   analysisJobs.set(jobId, { ...prev, liveLog: nextLog, updatedAt: new Date().toISOString() });
 }
 
+function normalizePromptOverride(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function renderPromptTemplate(template, vars = {}) {
+  return String(template || "").replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_match, key) => {
+    const value = vars[key];
+    return value == null ? "" : String(value);
+  });
+}
+
+function buildDefaultRefactorPrompt(projectPath, docsFiles) {
+  return [
+    "请调用 refactor-planner 技能，对当前项目进行重构分析与迭代规划。",
+    "要求：",
+    "1. 当前工作目录就是项目根目录，请同时分析整个项目代码。",
+    "2. 只分析 docs/ 目录根下的需求文档与规格文档，不要读取 docs 的子目录。",
+    `3. 当前可见的 docs 根目录 Markdown 文件有：${docsFiles.length ? docsFiles.join("、") : "（无）"}`,
+    "4. 如果你不确定这些文件里哪些才属于需求/规格文档，先按 NEED_USER_INPUT 协议通过飞书向用户确认，不要自行扩大范围。",
+    "5. 结合已确认的需求/规格文档和现有项目实现，生成迭代计划与重构报告。",
+    "6. 输出结果保存到 docs/refactor/ 目录下，至少包含：",
+    "   - docs/refactor/00-总览.md",
+    "   - docs/refactor/01-*.md",
+    "7. 全程使用中文。",
+    "8. 如果在分析过程中遇到任何无法确认的问题，不要自行假设，请按 NEED_USER_INPUT 协议输出问题。",
+    "",
+    "NEED_USER_INPUT 协议格式如下：",
+    "<<<NEED_USER_INPUT>>>",
+    "question: [要问用户的问题]",
+    "context: [为什么需要确认]",
+    "kind: [问题类型]",
+    "suggested_options:",
+    "- [选项1]",
+    "- [选项2]",
+    "<<<END_NEED_USER_INPUT>>>",
+    "",
+    "在收到用户回答后，请继续分析；如果还需要新的确认，可再次按上述格式提问。",
+  ].join("\n");
+}
+
+function buildRefactorPrompt(projectPath, docsFiles, promptOverride) {
+  const override = normalizePromptOverride(promptOverride);
+  if (!override) return buildDefaultRefactorPrompt(projectPath, docsFiles);
+  return renderPromptTemplate(override, {
+    projectPath,
+    docsFiles: docsFiles.length ? docsFiles.join("、") : "（无）",
+  });
+}
+
+function buildDefaultStoryMapPrompt(projectPath, projectId, refactorFiles) {
+  return [
+    "你现在要执行“需求分析结果同步到 Story Map”的任务。",
+    "目标：读取 docs/refactor/ 下的迭代文档，对比 sysbuilder 中当前项目的 Story Map，把明确全新的项新增进去；对完全重复的项跳过；对相近但不完全重复或归属不明确的项，必须先提问确认。",
+    "",
+    "当前上下文：",
+    `- 项目根目录：${projectPath}`,
+    `- 项目 ID：${projectId}`,
+    `- docs/refactor/ 下当前可见的 Markdown 文件：${refactorFiles.length ? refactorFiles.join("、") : "（无）"}`,
+    "",
+    "你必须使用当前已注入的 sysbuilder MCP，并按下面顺序执行：",
+    "1. 先读取本地 docs/refactor/00-总览.md，并按需继续读取 docs/refactor/ 下其他迭代文档，提取候选的 Activity / Epic / Story。",
+    `2. 调用 sysbuilder MCP 工具 get_project_context，参数 projectId='${projectId}'，先理解项目上下文。`,
+    `3. 调用 sysbuilder MCP 工具 load_story_map，参数 projectId='${projectId}'，读取当前 Story Map。`,
+    "4. 先在候选项内部去重，再与现有 Story Map 对比，把候选项严格分成三类：完全重复、相近待确认、明确全新。",
+    "5. 只对“明确全新且父级归属明确”的项执行新增，不要改写、合并、删除已有项。",
+    "",
+    "sysbuilder MCP 工具使用要求：",
+    `- 新增 Activity 时，调用 create_activity，参数至少包含 projectId='${projectId}'、activityName、description（可选）、createdBy='mcp'。`,
+    `- 新增 Epic 时，调用 create_epic，参数至少包含 activityId、epicName、createdBy='mcp'，并附 projectId='${projectId}'。`,
+    "- 新增 Story 时，调用 create_story，参数至少包含 epicId、brief、description（可选）；默认 state='TODO'，workType='USER_STORY'，除非文档明确表明它是技术故事。",
+    "- 不要调用 edit_story、update_story_status 去修改已有项，第一版只允许新增明确全新的项。",
+    "",
+    "判定规则：",
+    "- 完全重复：标题、意图、范围都已被现有 Story Map 覆盖，直接跳过。",
+    "- 相近待确认：语义接近但不完全等同，或可能是现有项的拆分/扩展/重命名，必须提问。",
+    "- 明确全新：现有 Story Map 中没有覆盖，且父级归属明确，可以直接新增。",
+    "",
+    "禁止事项：",
+    "- 不要尝试安装任何本地依赖。",
+    "- 不要尝试从本地源码目录手工启动新的 sysbuilder MCP。",
+    "- 不要绕过当前已注入的 sysbuilder MCP 去构造临时 client。",
+    "",
+    "如果你有任何无法确认的问题，必须按下面协议只输出一个问题块，不要混入其他总结：",
+    "<<<NEED_USER_INPUT>>>",
+    "question: [要问用户的问题]",
+    "context: [为什么需要确认，以及你已经识别到的候选项/相近项背景]",
+    "kind: [storymap-sync]",
+    "suggested_options:",
+    "- [选项1]",
+    "- [选项2]",
+    "<<<END_NEED_USER_INPUT>>>",
+    "",
+    "在收到用户回答后，请继续同步。",
+    "最终完成时请用中文给出简短结果总结，至少说明：新增了多少个 Activity、多少个 Epic、多少个 Story，跳过了多少个重复项，是否还有待确认项。",
+  ].join("\n");
+}
+
+function buildStoryMapPrompt(projectPath, projectId, refactorFiles, promptOverride) {
+  const override = normalizePromptOverride(promptOverride);
+  if (!override) return buildDefaultStoryMapPrompt(projectPath, projectId, refactorFiles);
+  return renderPromptTemplate(override, {
+    projectPath,
+    projectId,
+    refactorFiles: refactorFiles.length ? refactorFiles.join("、") : "（无）",
+  });
+}
+
+function buildDefaultCarpmPrompt() {
+  return [
+    "请调用 carpm-analyzer 对当前项目进行完整 CARPM 分析。",
+    "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
+    "",
+    "输出要求：",
+    "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
+    "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
+    "3. 全程使用中文。",
+    "4. 全部完成后再回复：CARPM 分析完成。",
+  ].join("\n");
+}
+
+function buildCarpmPrompt(localPath, promptOverride) {
+  const override = normalizePromptOverride(promptOverride);
+  if (!override) return buildDefaultCarpmPrompt();
+  return renderPromptTemplate(override, { projectPath: localPath });
+}
+
 function isJobStopRequested(jobId) {
   return Boolean(analysisJobs.get(jobId)?.stopRequested);
 }
@@ -1465,32 +1591,7 @@ async function startRefactorAnalysis(projectPath, options = {}) {
       "如果过程中有疑问，我会继续在群里提问；届时请把你的回复内容直接当作该问题的答案。",
     ].join("\n"), notifyChatId);
 
-    const prompt = [
-      "请调用 refactor-planner 技能，对当前项目进行重构分析与迭代规划。",
-      "要求：",
-      "1. 当前工作目录就是项目根目录，请同时分析整个项目代码。",
-      "2. 只分析 docs/ 目录根下的需求文档与规格文档，不要读取 docs 的子目录。",
-      `3. 当前可见的 docs 根目录 Markdown 文件有：${docsFiles.length ? docsFiles.join("、") : "（无）"}`,
-      "4. 如果你不确定这些文件里哪些才属于需求/规格文档，先按 NEED_USER_INPUT 协议通过飞书向用户确认，不要自行扩大范围。",
-      "5. 结合已确认的需求/规格文档和现有项目实现，生成迭代计划与重构报告。",
-      "6. 输出结果保存到 docs/refactor/ 目录下，至少包含：",
-      "   - docs/refactor/00-总览.md",
-      "   - docs/refactor/01-*.md",
-      "7. 全程使用中文。",
-      "8. 如果在分析过程中遇到任何无法确认的问题，不要自行假设，请按 NEED_USER_INPUT 协议输出问题。",
-      "",
-      "NEED_USER_INPUT 协议格式如下：",
-      "<<<NEED_USER_INPUT>>>",
-      "question: [要问用户的问题]",
-      "context: [为什么需要确认]",
-      "kind: [问题类型]",
-      "suggested_options:",
-      "- [选项1]",
-      "- [选项2]",
-      "<<<END_NEED_USER_INPUT>>>",
-      "",
-      "在收到用户回答后，请继续分析；如果还需要新的确认，可再次按上述格式提问。",
-    ].join("\n");
+    const prompt = buildRefactorPrompt(projectPath, docsFiles, options.promptOverride);
 
     continueRefactorAnalysis(analysisJobs.get(jobId), prompt).catch((err) => {
       updateJob(jobId, { status: "failed", error: err?.message || String(err) });
@@ -1588,51 +1689,7 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
       "如果过程中存在相近但无法自动判定的项，我会继续在群里提问确认。",
     ].filter(Boolean).join("\n"), notifyChatId);
 
-    const prompt = [
-      "你现在要执行“需求分析结果同步到 Story Map”的任务。",
-      "目标：读取 docs/refactor/ 下的迭代文档，对比 sysbuilder 中当前项目的 Story Map，把明确全新的项新增进去；对完全重复的项跳过；对相近但不完全重复或归属不明确的项，必须先提问确认。",
-      "",
-      "当前上下文：",
-      `- 项目根目录：${projectPath}`,
-      `- 项目 ID：${projectId}`,
-      `- docs/refactor/ 下当前可见的 Markdown 文件：${refactorFiles.length ? refactorFiles.join("、") : "（无）"}`,
-      "",
-      "你必须使用当前已注入的 sysbuilder MCP，并按下面顺序执行：",
-      "1. 先读取本地 docs/refactor/00-总览.md，并按需继续读取 docs/refactor/ 下其他迭代文档，提取候选的 Activity / Epic / Story。",
-      `2. 调用 sysbuilder MCP 工具 get_project_context，参数 projectId='${projectId}'，先理解项目上下文。`,
-      `3. 调用 sysbuilder MCP 工具 load_story_map，参数 projectId='${projectId}'，读取当前 Story Map。`,
-      "4. 先在候选项内部去重，再与现有 Story Map 对比，把候选项严格分成三类：完全重复、相近待确认、明确全新。",
-      "5. 只对“明确全新且父级归属明确”的项执行新增，不要改写、合并、删除已有项。",
-      "",
-      "sysbuilder MCP 工具使用要求：",
-      `- 新增 Activity 时，调用 create_activity，参数至少包含 projectId='${projectId}'、activityName、description（可选）、createdBy='mcp'。`,
-      `- 新增 Epic 时，调用 create_epic，参数至少包含 activityId、epicName、createdBy='mcp'，并附 projectId='${projectId}'。`,
-      "- 新增 Story 时，调用 create_story，参数至少包含 epicId、brief、description（可选）；默认 state='TODO'，workType='USER_STORY'，除非文档明确表明它是技术故事。",
-      "- 不要调用 edit_story、update_story_status 去修改已有项，第一版只允许新增明确全新的项。",
-      "",
-      "判定规则：",
-      "- 完全重复：标题、意图、范围都已被现有 Story Map 覆盖，直接跳过。",
-      "- 相近待确认：语义接近但不完全等同，或可能是现有项的拆分/扩展/重命名，必须提问。",
-      "- 明确全新：现有 Story Map 中没有覆盖，且父级归属明确，可以直接新增。",
-      "",
-      "禁止事项：",
-      "- 不要尝试安装任何本地依赖。",
-      "- 不要尝试从本地源码目录手工启动新的 sysbuilder MCP。",
-      "- 不要绕过当前已注入的 sysbuilder MCP 去构造临时 client。",
-      "",
-      "如果你有任何无法确认的问题，必须按下面协议只输出一个问题块，不要混入其他总结：",
-      "<<<NEED_USER_INPUT>>>",
-      "question: [要问用户的问题]",
-      "context: [为什么需要确认，以及你已经识别到的候选项/相近项背景]",
-      "kind: [storymap-sync]",
-      "suggested_options:",
-      "- [选项1]",
-      "- [选项2]",
-      "<<<END_NEED_USER_INPUT>>>",
-      "",
-      "在收到用户回答后，请继续同步。",
-      "最终完成时请用中文给出简短结果总结，至少说明：新增了多少个 Activity、多少个 Epic、多少个 Story，跳过了多少个重复项，是否还有待确认项。",
-    ].join("\n");
+    const prompt = buildStoryMapPrompt(projectPath, projectId, refactorFiles, options.promptOverride);
 
     continueStoryMapSync(analysisJobs.get(jobId), prompt).catch((err) => {
       updateJob(jobId, { status: "failed", error: err?.message || String(err) });
@@ -1757,11 +1814,12 @@ function createHttpServer() {
         const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
         const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
         const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+        const promptOverride = normalizePromptOverride(body.promptOverride);
         if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
         if (!resolveTaskChat(buildChatRouteKey(userId, projectId))) {
           return sendJson(res, 400, { error: "尚无可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID" });
         }
-        const jobId = await startRefactorAnalysis(projectPath, { userId, projectId });
+        const jobId = await startRefactorAnalysis(projectPath, { userId, projectId, promptOverride });
         return sendJson(res, 200, { jobId });
       }
 
@@ -1770,12 +1828,13 @@ function createHttpServer() {
         const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
         const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
         const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+        const promptOverride = normalizePromptOverride(body.promptOverride);
         if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
         if (!projectId) return sendJson(res, 400, { error: "projectId is required" });
         if (!resolveTaskChat(buildChatRouteKey(userId, projectId))) {
           return sendJson(res, 400, { error: "尚无可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID" });
         }
-        const jobId = await startStoryMapSync(projectPath, projectId, { userId });
+        const jobId = await startStoryMapSync(projectPath, projectId, { userId, promptOverride });
         return sendJson(res, 200, { jobId });
       }
 
@@ -1912,16 +1971,7 @@ async function runAnalysisSession(localPath, options = {}) {
   });
   activeReportRun = reportRun;
 
-  const prompt = [
-    "请调用 carpm-analyzer 对当前项目进行完整 CARPM 分析。",
-    "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
-    "",
-    "输出要求：",
-    "1. 将 Markdown 报告保存到 docs/carpm-output/carpm-report.md。",
-    "2. 将 JSON 基线保存到 docs/carpm-output/carpm-baseline.json。",
-    "3. 全程使用中文。",
-    "4. 全部完成后再回复：CARPM 分析完成。",
-  ].join("\n");
+  const prompt = buildCarpmPrompt(localPath, options.promptOverride);
 
   try {
     updateReportRun(reportRun, { status: "running" });
@@ -2041,6 +2091,7 @@ async function pollAndProcessReports() {
   const { reportId, projectId, title, requestContext } = pending[0];
   let ctx = {};
   try { ctx = JSON.parse(requestContext || "{}"); } catch {}
+  const promptOverride = normalizePromptOverride(ctx.promptOverride);
   const reportRouteKey = buildChatRouteKey(ctx.userId, projectId);
   const reportNotifyChatId = reportRouteKey ? resolveTaskChat(reportRouteKey) : null;
   const localPath = ctx.localPath
@@ -2075,7 +2126,7 @@ async function pollAndProcessReports() {
     let markdown = "", baselineJson = null;
     let status = "COMPLETED";
     try {
-      ({ markdown, baselineJson } = await runAnalysisSession(localPath, { reportId, projectId }));
+      ({ markdown, baselineJson } = await runAnalysisSession(localPath, { reportId, projectId, promptOverride }));
     } catch (err) {
       log.error(`分析失败：${err.message}`);
       status = "FAILED";
