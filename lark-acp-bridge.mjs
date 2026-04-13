@@ -713,12 +713,33 @@ function getCurrentTaskChatId(options = {}) {
   return lastChatId;
 }
 
+function splitLarkText(text, maxChars = 8000) {
+  const normalized = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return [""];
+  if (normalized.length <= maxChars) return [normalized];
+
+  const chunks = [];
+  let remaining = normalized;
+  while (remaining.length > maxChars) {
+    let splitAt = remaining.lastIndexOf("\n", maxChars);
+    if (splitAt <= 0) splitAt = maxChars;
+    chunks.push(remaining.slice(0, splitAt).trim());
+    remaining = remaining.slice(splitAt).trim();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks.filter(Boolean);
+}
+
 function notifyLark(text, chatId = lastChatId) {
   if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
   const plainText = String(text || "").replace(/\r\n/g, "\n").trim();
   try {
     log.info(`notifyLark 调用：chatId=${chatId} textLength=${plainText.length} preview=${JSON.stringify(plainText.slice(0, 40))}`);
-    execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", plainText || String(text || "")]);
+    const chunks = splitLarkText(plainText || String(text || ""));
+    chunks.forEach((chunk, index) => {
+      const chunkText = chunks.length > 1 ? `（第 ${index + 1}/${chunks.length} 段）\n${chunk}` : chunk;
+      execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", chunkText]);
+    });
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
@@ -1207,22 +1228,14 @@ function listRefactorMarkdown(projectPath) {
 }
 
 function buildStoryMapSyncCompletionSummary(job, replyText) {
-  const lines = String(replyText || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const summaryStart = lines.findIndex((line) => /^结果摘要[:：]?$/.test(line));
-  const fullSummaryLines = summaryStart >= 0 ? lines.slice(summaryStart + 1) : lines;
-  const summaryLines = fullSummaryLines.slice(0, 24);
-  const omittedCount = Math.max(0, fullSummaryLines.length - summaryLines.length);
+  const fullReply = String(replyText || "").replace(/\r\n/g, "\n").trim();
 
   return [
     "✅ Story Map 同步已完成",
     `项目目录：${job.projectPath}`,
     job.projectId ? `项目 ID：${job.projectId}` : null,
-    summaryLines.length ? "结果摘要：" : null,
-    ...(summaryLines.length ? summaryLines : []),
-    omittedCount > 0 ? `……其余 ${omittedCount} 行已省略` : null,
+    fullReply ? "模型回复：" : null,
+    fullReply || "（模型未返回正文）",
   ].filter(Boolean).join("\n");
 }
 
