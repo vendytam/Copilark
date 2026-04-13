@@ -1207,11 +1207,14 @@ function listRefactorMarkdown(projectPath) {
 }
 
 function buildStoryMapSyncCompletionSummary(job, replyText) {
-  const summaryLines = String(replyText || "")
+  const lines = String(replyText || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .slice(-4);
+    .filter(Boolean);
+  const summaryStart = lines.findIndex((line) => /^结果摘要[:：]?$/.test(line));
+  const fullSummaryLines = summaryStart >= 0 ? lines.slice(summaryStart + 1) : lines;
+  const summaryLines = fullSummaryLines.slice(0, 24);
+  const omittedCount = Math.max(0, fullSummaryLines.length - summaryLines.length);
 
   return [
     "✅ Story Map 同步已完成",
@@ -1219,6 +1222,7 @@ function buildStoryMapSyncCompletionSummary(job, replyText) {
     job.projectId ? `项目 ID：${job.projectId}` : null,
     summaryLines.length ? "结果摘要：" : null,
     ...(summaryLines.length ? summaryLines : []),
+    omittedCount > 0 ? `……其余 ${omittedCount} 行已省略` : null,
   ].filter(Boolean).join("\n");
 }
 
