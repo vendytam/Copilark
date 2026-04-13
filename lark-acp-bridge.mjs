@@ -1103,25 +1103,25 @@ function buildStoryMapPrompt(projectPath, projectId, refactorFiles, promptOverri
 }
 
 function getCapmOutputPaths(localPath) {
-  const outputDir = join(localPath, "sysbuilder", "capm-output");
+  const outputDir = join(localPath, "sysbuilder", "project-analysis");
   return {
     outputDir,
-    reportPath: join(outputDir, "capm-report.md"),
-    baselinePath: join(outputDir, "capm-baseline.json"),
+    reportPath: join(outputDir, "analysis-report.md"),
+    baselinePath: join(outputDir, "analysis-baseline.json"),
   };
 }
 
 function buildDefaultCapmPrompt() {
   const paths = getCapmOutputPaths(".");
   return [
-    "请调用 capm-analysis 对当前项目进行完整 CAPM 分析。",
+    "请调用 project-analysis 对当前项目进行完整项目分析。",
     "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
     "",
     "输出要求：",
     `1. 将 Markdown 报告保存到 ${paths.reportPath.replace(/\\/g, "/")}。`,
     `2. 将 JSON 基线保存到 ${paths.baselinePath.replace(/\\/g, "/")}。`,
     "3. 全程使用中文。",
-    "4. 全部完成后再回复：CAPM 分析完成。",
+    "4. 全部完成后再回复：项目分析完成。",
   ].join("\n");
 }
 
@@ -2026,7 +2026,7 @@ async function runAnalysisSession(localPath, options = {}) {
 
   try {
     updateReportRun(reportRun, { status: "running" });
-    appendReportLiveLog(reportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已启动 CAPM 分析会话\n`);
+    appendReportLiveLog(reportRun, `[${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] 已启动项目分析会话\n`);
     await Promise.race([
       sendToACP(conn2, client2, sid2, prompt, (chunk) => appendReportLiveLog(reportRun, chunk)),
       reportRun.abortPromise,
