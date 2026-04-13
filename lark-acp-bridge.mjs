@@ -1102,7 +1102,7 @@ function buildStoryMapPrompt(projectPath, projectId, refactorFiles, promptOverri
   });
 }
 
-function getCapmOutputPaths(localPath) {
+function getAnalysisOutputPaths(localPath) {
   const outputDir = join(localPath, "sysbuilder", "project-analysis");
   return {
     outputDir,
@@ -1111,8 +1111,8 @@ function getCapmOutputPaths(localPath) {
   };
 }
 
-function buildDefaultCapmPrompt() {
-  const paths = getCapmOutputPaths(".");
+function buildDefaultAnalysisPrompt() {
+  const paths = getAnalysisOutputPaths(".");
   return [
     "请调用 project-analysis 对当前项目进行完整项目分析。",
     "这是必选项，不要改用其他分析方式，也不要因为缺少替代 skill 而变更流程。",
@@ -1125,13 +1125,16 @@ function buildDefaultCapmPrompt() {
   ].join("\n");
 }
 
-function buildCapmPrompt(localPath, reportId, promptOverride) {
+function buildAnalysisPrompt(localPath, reportId, promptOverride) {
   const override = normalizePromptOverride(promptOverride);
-  const paths = getCapmOutputPaths(localPath);
-  if (!override) return buildDefaultCapmPrompt();
+  const paths = getAnalysisOutputPaths(localPath);
+  if (!override) return buildDefaultAnalysisPrompt();
   return renderPromptTemplate(override, {
     projectPath: localPath,
     reportId: typeof reportId === "string" ? reportId.trim() : "",
+    analysisOutputDir: paths.outputDir.replace(/\\/g, "/"),
+    analysisReportPath: paths.reportPath.replace(/\\/g, "/"),
+    analysisBaselinePath: paths.baselinePath.replace(/\\/g, "/"),
     capmOutputDir: paths.outputDir.replace(/\\/g, "/"),
     capmReportPath: paths.reportPath.replace(/\\/g, "/"),
     capmBaselinePath: paths.baselinePath.replace(/\\/g, "/"),
@@ -2022,7 +2025,7 @@ async function runAnalysisSession(localPath, options = {}) {
   });
   activeReportRun = reportRun;
 
-  const prompt = buildCapmPrompt(localPath, reportRun.reportId, options.promptOverride);
+  const prompt = buildAnalysisPrompt(localPath, reportRun.reportId, options.promptOverride);
 
   try {
     updateReportRun(reportRun, { status: "running" });
@@ -2043,7 +2046,7 @@ async function runAnalysisSession(localPath, options = {}) {
   }
 
   // 读取分析输出文件（Agent 已写入项目目录）
-  const { reportPath, baselinePath } = getCapmOutputPaths(localPath);
+  const { reportPath, baselinePath } = getAnalysisOutputPaths(localPath);
 
   const markdown    = existsSync(reportPath)   ? readFileSync(reportPath,   "utf8") : null;
   const baselineJson = existsSync(baselinePath) ? readFileSync(baselinePath, "utf8") : null;
