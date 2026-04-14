@@ -20,7 +20,7 @@ import https from "node:https";
 import { execSync, execFileSync, spawnSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, unlinkSync, readdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { Writable, Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
@@ -44,6 +44,7 @@ const SESSION_FILE    = join(import.meta.dirname, ".acp-session-id");
 const BRIDGE_AUTH_FILE = join(homedir(), ".copilark", "bridge-auth.txt");
 const LAST_CHAT_ID_FILE = join(homedir(), ".copilark", "last-chat-id.txt");
 const CHAT_ROUTE_FILE = join(homedir(), ".copilark", "chat-routing.json");
+const AUTO_DEV_MEMORY_FILE = join(homedir(), ".copilark", "auto-dev-memory.json");
 const COPILOT_MCP_CONFIG_FILE = join(homedir(), ".copilot", "mcp-config.json");
 
 function readEnvPath(name) {
@@ -398,6 +399,288 @@ function parseJsonObject(raw, fallback = {}) {
   }
 }
 
+function normalizeProjectBindingKey(projectPath) {
+  return String(projectPath || "").trim().replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
+}
+
+function normalizeAutoDevMemoryType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (["memory", "记忆", "经验记录", "context"].includes(normalized)) return "memory";
+  if (["lesson", "experience", "经验", "教训", "经验教训"].includes(normalized)) return "lesson";
+  return null;
+}
+
+function loadAutoDevMemoryStore() {
+  const raw = readJsonFile(AUTO_DEV_MEMORY_FILE, { projects: {} });
+  const projects = raw && typeof raw === "object" && raw.projects && typeof raw.projects === "object"
+    ? raw.projects
+    : {};
+  return { projects };
+}
+
+function saveAutoDevMemoryStore(store) {
+  try {
+    writeFileSync(AUTO_DEV_MEMORY_FILE, JSON.stringify(store, null, 2), "utf8");
+  } catch (err) {
+    log.warn(`persist auto-dev memory 失败：${err?.message || String(err)}`);
+  }
+}
+
+function deriveAutoDevMemoryTitle(content) {
+  const normalized = String(content || "").replace(/\r/g, "").trim();
+  if (!normalized) return "未命名记录";
+  const firstLine = normalized.split("\n").find(Boolean) || normalized;
+  return firstLine.length > 48 ? `${firstLine.slice(0, 48)}...` : firstLine;
+}
+
+function listProjectAutoDevMemories(projectPath) {
+  const key = normalizeProjectBindingKey(projectPath);
+  if (!key) return [];
+  const store = loadAutoDevMemoryStore();
+  const bucket = store.projects[key];
+  const entries = Array.isArray(bucket?.entries) ? bucket.entries.filter((entry) => entry && typeof entry === "object") : [];
+  return entries.sort((a, b) => new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime());
+}
+
+function upsertProjectAutoDevMemory(projectPath, payload) {
+  const key = normalizeProjectBindingKey(projectPath);
+  const type = normalizeAutoDevMemoryType(payload?.type);
+  const content = String(payload?.content || "").trim();
+  if (!key || !type || !content) return null;
+
+  const store = loadAutoDevMemoryStore();
+  const bucket = store.projects[key] && typeof store.projects[key] === "object"
+    ? store.projects[key]
+    : { projectPath: String(projectPath || "").trim(), entries: [] };
+  const entries = Array.isArray(bucket.entries) ? bucket.entries : [];
+  const title = String(payload?.title || "").trim() || deriveAutoDevMemoryTitle(content);
+  const now = new Date().toISOString();
+  const existing = entries.find((entry) => (
+    entry.type === type
+    && String(entry.title || "").trim() === title
+    && String(entry.content || "").trim() === content
+  ));
+
+  if (existing) {
+    Object.assign(existing, {
+      updatedAt: now,
+      source: payload?.source === "manual" ? "manual" : existing.source || "auto",
+      storyId: payload?.storyId || existing.storyId || null,
+      storyCode: payload?.storyCode || existing.storyCode || null,
+      jobId: payload?.jobId || existing.jobId || null,
+    });
+  } else {
+    entries.unshift({
+      id: `adm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      type,
+      title,
+      content,
+      source: payload?.source === "manual" ? "manual" : "auto",
+      storyId: payload?.storyId || null,
+      storyCode: payload?.storyCode || null,
+      jobId: payload?.jobId || null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  store.projects[key] = {
+    projectPath: bucket.projectPath || String(projectPath || "").trim(),
+    entries: entries.slice(0, 200),
+  };
+  saveAutoDevMemoryStore(store);
+  return existing || entries[0];
+}
+
+function deleteProjectAutoDevMemory(projectPath, entryId) {
+  const key = normalizeProjectBindingKey(projectPath);
+  const normalizedId = String(entryId || "").trim();
+  if (!key || !normalizedId) return { deleted: false, entries: [] };
+
+  const store = loadAutoDevMemoryStore();
+  const bucket = store.projects[key];
+  const entries = Array.isArray(bucket?.entries) ? bucket.entries.filter((entry) => entry && typeof entry === "object") : [];
+  const nextEntries = entries.filter((entry) => String(entry.id || "").trim() !== normalizedId);
+  const deleted = nextEntries.length !== entries.length;
+
+  if (!bucket) return { deleted: false, entries: [] };
+
+  store.projects[key] = {
+    projectPath: bucket.projectPath || String(projectPath || "").trim(),
+    entries: nextEntries,
+  };
+  saveAutoDevMemoryStore(store);
+  return { deleted, entries: nextEntries };
+}
+
+function clearProjectAutoDevMemories(projectPath, type) {
+  const key = normalizeProjectBindingKey(projectPath);
+  const normalizedType = type ? normalizeAutoDevMemoryType(type) : null;
+  if (!key) return { cleared: 0, entries: [] };
+
+  const store = loadAutoDevMemoryStore();
+  const bucket = store.projects[key];
+  const entries = Array.isArray(bucket?.entries) ? bucket.entries.filter((entry) => entry && typeof entry === "object") : [];
+  if (!bucket) return { cleared: 0, entries: [] };
+
+  const nextEntries = normalizedType
+    ? entries.filter((entry) => entry.type !== normalizedType)
+    : [];
+  const cleared = entries.length - nextEntries.length;
+
+  store.projects[key] = {
+    projectPath: bucket.projectPath || String(projectPath || "").trim(),
+    entries: nextEntries,
+  };
+  saveAutoDevMemoryStore(store);
+  return { cleared, entries: nextEntries };
+}
+
+function extractAutoDevMemoryBlocks(text) {
+  if (!text) return [];
+  const items = [];
+  const regex = /<<<AUTO_DEV_MEMORY>>>([\s\S]*?)<<<END_AUTO_DEV_MEMORY>>>/g;
+  let match;
+  while ((match = regex.exec(text))) {
+    const block = String(match[1] || "").replace(/\r/g, "").trim();
+    if (!block) continue;
+    const lines = block.split("\n");
+    let type = null;
+    let title = "";
+    let inContent = false;
+    const contentLines = [];
+    for (const rawLine of lines) {
+      const line = rawLine.trimEnd();
+      if (/^type\s*:/i.test(line)) {
+        type = normalizeAutoDevMemoryType(line.replace(/^type\s*:/i, "").trim());
+        continue;
+      }
+      if (/^title\s*:/i.test(line)) {
+        title = line.replace(/^title\s*:/i, "").trim();
+        continue;
+      }
+      if (/^content\s*:/i.test(line)) {
+        inContent = true;
+        const rest = line.replace(/^content\s*:/i, "").trim();
+        if (rest) contentLines.push(rest);
+        continue;
+      }
+      if (inContent) {
+        contentLines.push(rawLine);
+      }
+    }
+    const content = contentLines.join("\n").trim();
+    if (!type || !content) continue;
+    items.push({ type, title, content });
+  }
+  return items;
+}
+
+function buildAutoDevKnowledgeSections(projectPath) {
+  const entries = listProjectAutoDevMemories(projectPath);
+  const render = (type) => {
+    const filtered = entries.filter((entry) => entry.type === type);
+    if (!filtered.length) return "（暂无）";
+    return filtered.map((entry, index) => {
+      const sourceLabel = entry.source === "manual" ? "手动" : "自动";
+      return `${index + 1}. ${entry.title} [${sourceLabel}]\n${entry.content}`;
+    }).join("\n\n");
+  };
+  return {
+    memoryText: render("memory"),
+    lessonText: render("lesson"),
+  };
+}
+
+const projectNameCache = new Map();
+
+async function getProjectName(projectId, projectPath) {
+  const normalizedProjectId = String(projectId || "").trim();
+  if (normalizedProjectId) {
+    if (projectNameCache.has(normalizedProjectId)) {
+      return projectNameCache.get(normalizedProjectId) || "";
+    }
+    try {
+      const res = await backendRequest("GET", `/api/projects/${encodeURIComponent(normalizedProjectId)}`);
+      const body = res?.body && typeof res.body === "object" ? res.body : {};
+      const projectName = typeof body.projectName === "string"
+        ? body.projectName.trim()
+        : typeof body?.data?.projectName === "string"
+          ? body.data.projectName.trim()
+          : "";
+      if (projectName) {
+        projectNameCache.set(normalizedProjectId, projectName);
+        return projectName;
+      }
+    } catch {}
+    projectNameCache.set(normalizedProjectId, "");
+    return "";
+  }
+
+  const normalizedPath = String(projectPath || "").trim().replace(/[\\/]+$/, "");
+  return normalizedPath ? basename(normalizedPath) : "";
+}
+
+async function buildProjectIdentityLines(projectPath, projectId) {
+  const projectName = await getProjectName(projectId, projectPath);
+  return [
+    projectName ? `项目名称：${projectName}` : null,
+    projectId ? `项目 ID：${projectId}` : null,
+  ].filter(Boolean);
+}
+
+function buildAutoDevUndoPrompt(job) {
+  return [
+    `你正在取消 AutoCoder 会话 ${job.jobId}。`,
+    "现在你必须先停止当前剩余动作，然后在当前工作目录中本地撤销本次 AutoCoder 会话自己做出的代码与文件改动。",
+    "",
+    "强制规则：",
+    "1. 不要使用 git、git restore、git checkout、git reset、git clean、stash 等任何 git 回退手段。",
+    "2. 只能通过你自己的文件编辑能力，在工作区内把本次会话产生的改动撤销掉。",
+    "3. 只撤销本次 AutoCoder 会话自己引入的改动；不要碰用户原本就有的内容。",
+    "4. 不要继续实现新功能，不要继续分析，只做本地撤销。",
+    "5. 不要向用户提问；如果有无法安全撤销的部分，直接保留并在结尾说明。",
+    "",
+    "请完成后仅输出一个简短结果块，格式必须严格如下：",
+    "<<<AUTO_DEV_UNDO_RESULT>>>",
+    "summary: <一句中文总结，说明撤销结果>",
+    "<<<END_AUTO_DEV_UNDO_RESULT>>>",
+  ].join("\n");
+}
+
+function parseAutoDevUndoResult(text) {
+  const match = String(text || "").match(/<<<AUTO_DEV_UNDO_RESULT>>>([\s\S]*?)<<<END_AUTO_DEV_UNDO_RESULT>>>/);
+  if (!match) return null;
+  const block = match[1].trim();
+  const summaryLine = block.split(/\r?\n/).find((line) => line.trim().toLowerCase().startsWith("summary:"));
+  const summary = summaryLine ? summaryLine.replace(/^summary:\s*/i, "").trim() : "";
+  return summary ? { summary } : null;
+}
+
+async function undoAutoDevChangesByCoder(job) {
+  if (!job?.connection || !job?.client || !job?.sessionId) {
+    return {
+      applied: false,
+      summary: "当前 AutoCoder 会话已不可用，未能执行本地撤销。",
+    };
+  }
+
+  const undoPrompt = buildAutoDevUndoPrompt(job);
+  const replyText = await sendToACP(
+    job.connection,
+    job.client,
+    job.sessionId,
+    undoPrompt,
+    (chunk) => appendJobLiveLog(job.jobId, chunk),
+  );
+  const parsed = parseAutoDevUndoResult(replyText);
+  return {
+    applied: true,
+    summary: parsed?.summary || "已请求 AutoCoder 在本地撤销本次会话改动。",
+    rawReply: replyText,
+  };
+}
+
 function parseRemoteMcpFromEnv() {
   const url = typeof process.env.SYSBUILDER_MCP_URL === "string" ? process.env.SYSBUILDER_MCP_URL.trim() : "";
   if (!url) return null;
@@ -704,6 +987,39 @@ function backendRequest(method, urlPath, body) {
   });
 }
 
+async function syncStoryStatusByBridge(projectId, storyId, state, options = {}) {
+  const normalizedProjectId = typeof projectId === "string" ? projectId.trim() : "";
+  const normalizedStoryId = typeof storyId === "string" ? storyId.trim() : "";
+  const normalizedState = typeof state === "string" ? state.trim().toUpperCase() : "";
+  if (!normalizedProjectId || !normalizedStoryId || !normalizedState) return false;
+
+  const res = await backendRequest("POST", "/api/story-map/story/update-status", {
+    projectId: normalizedProjectId,
+    storyId: normalizedStoryId,
+    status: normalizedState,
+    state: normalizedState,
+  });
+  const body = res?.body && typeof res.body === "object" ? res.body : null;
+  const bodyCode = typeof body?.code === "number" ? body.code : null;
+  const bodySuccess = typeof body?.success === "boolean" ? body.success : null;
+  const requestSucceeded =
+    !!res &&
+    res.status >= 200 &&
+    res.status < 300 &&
+    bodyCode !== 500 &&
+    bodySuccess !== false;
+  if (!requestSucceeded) {
+    const detail = typeof res?.body === "string" ? res.body : JSON.stringify(res?.body || {});
+    throw new Error(`状态同步失败（${normalizedState}）：${detail || `HTTP ${res?.status || "unknown"}`}`);
+  }
+
+  log.info(`Bridge 已同步 Story 状态：projectId=${normalizedProjectId} storyId=${normalizedStoryId} state=${normalizedState}`);
+  if (options.jobId) {
+    appendJobLiveLog(options.jobId, `\n[Bridge] 已同步 Story 状态 -> ${normalizedState}\n`);
+  }
+  return true;
+}
+
 // ─── 飞书群主动通知 ───────────────────────────────────────────────────────────
 
 function getCurrentTaskChatId(options = {}) {
@@ -730,20 +1046,60 @@ function splitLarkText(text, maxChars = 8000) {
   return chunks.filter(Boolean);
 }
 
-function notifyLark(text, chatId = lastChatId) {
-  if (!chatId) { log.warn("notifyLark: 尚无 chat_id，跳过通知"); return; }
+function tryParseJson(text) {
+  if (typeof text !== "string") return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractLarkMessageId(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const candidates = [
+    payload.message_id,
+    payload.messageId,
+    payload.data?.message_id,
+    payload.data?.messageId,
+    payload.data?.message?.message_id,
+    payload.data?.message?.messageId,
+    payload.message?.message_id,
+    payload.message?.messageId,
+  ];
+  return candidates.find((value) => typeof value === "string" && value.trim())?.trim() || "";
+}
+
+function sendLarkText(text, chatId = lastChatId) {
+  if (!chatId) {
+    log.warn("notifyLark: 尚无 chat_id，跳过通知");
+    return [];
+  }
   const plainText = String(text || "").replace(/\r\n/g, "\n").trim();
   try {
     log.info(`notifyLark 调用：chatId=${chatId} textLength=${plainText.length} preview=${JSON.stringify(plainText.slice(0, 40))}`);
     const chunks = splitLarkText(plainText || String(text || ""));
+    const sent = [];
     chunks.forEach((chunk, index) => {
       const chunkText = chunks.length > 1 ? `（第 ${index + 1}/${chunks.length} 段）\n${chunk}` : chunk;
-      execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", chunkText]);
+      const raw = execLarkCli(["im", "+messages-send", "--chat-id", chatId, "--text", chunkText]);
+      const payload = tryParseJson(raw);
+      sent.push({
+        raw,
+        payload,
+        messageId: extractLarkMessageId(payload),
+      });
     });
     log.info(`Lark 通知已发送到 ${chatId}：${text.slice(0, 80)}`);
+    return sent;
   } catch (e) {
     log.error(`Lark 通知失败：${e.message}`);
+    return [];
   }
+}
+
+function notifyLark(text, chatId = lastChatId) {
+  return sendLarkText(text, chatId);
 }
 
 // ─── ACP 连接 & 会话 ──────────────────────────────────────────────────────────
@@ -991,7 +1347,11 @@ function sendQuestionToLark(ticket) {
     "注意：此时你的回复内容会被当作该问题的答案继续送回分析流程，请尽量直接回答，不要闲聊。",
     ...(ticket.options.length ? ["可选：", ...ticket.options.map((opt, i) => `${i + 1}. ${opt}`)] : []),
   ].filter(Boolean);
-  notifyLark(lines.join("\n"), ticket.chatId);
+  const sent = notifyLark(lines.join("\n"), ticket.chatId);
+  const messageIds = sent.map((item) => item.messageId).filter(Boolean);
+  if (messageIds.length) {
+    waitingTickets.set(ticket.ticketId, { ...ticket, messageIds });
+  }
 }
 
 function updateJob(jobId, patch) {
@@ -1000,10 +1360,47 @@ function updateJob(jobId, patch) {
   analysisJobs.set(jobId, { ...prev, ...patch, updatedAt: new Date().toISOString() });
 }
 
+function isTicketWaiting(ticket) {
+  return Boolean(ticket && ticket.status === "waiting");
+}
+
+function collectReplyReferenceIds(value, result = []) {
+  if (!value || typeof value !== "object") return result;
+  for (const [key, nested] of Object.entries(value)) {
+    const normalizedKey = String(key || "").toLowerCase();
+    if (typeof nested === "string") {
+      if (/(^|_)(parent|root|upper|reply(?:_to)?)(?:_message)?_id$/.test(normalizedKey) && nested.trim()) {
+        result.push(nested.trim());
+      }
+      continue;
+    }
+    if (nested && typeof nested === "object") {
+      collectReplyReferenceIds(nested, result);
+    }
+  }
+  return result;
+}
+
+function extractReplyMessageIds(event) {
+  return [...new Set(collectReplyReferenceIds(event).filter(Boolean))];
+}
+
+function escapeRegExp(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeTicketAnswerText(answerText, ticketId) {
+  const normalized = String(answerText || "").trim();
+  if (!normalized || !ticketId) return normalized;
+  return normalized.replace(new RegExp(`^\\[${escapeRegExp(ticketId)}\\]\\s*[:：-]?\\s*`, "i"), "").trim() || normalized;
+}
+
 function appendJobLiveLog(jobId, chunk) {
   const prev = analysisJobs.get(jobId);
   if (!prev || !chunk) return;
-  const nextLog = ((prev.liveLog || "") + chunk).slice(-16000);
+  const nextLog = prev.kind === "auto-dev"
+    ? ((prev.liveLog || "") + chunk)
+    : ((prev.liveLog || "") + chunk).slice(-16000);
   analysisJobs.set(jobId, { ...prev, liveLog: nextLog, updatedAt: new Date().toISOString() });
 }
 
@@ -1123,6 +1520,82 @@ function buildStoryMapPrompt(projectPath, projectId, refactorFiles, promptOverri
   });
 }
 
+function buildDefaultAutoDevPrompt(projectPath, story) {
+  const { memoryText, lessonText } = buildAutoDevKnowledgeSections(projectPath);
+  return [
+    "你现在要执行一个 Story 的 AutoCoder 自动开发任务。",
+    "当前上下文：",
+    `- 项目根目录：${projectPath}`,
+    `- 项目 ID：${story.projectId || "（无）"}`,
+    `- Story ID：${story.storyId}`,
+    `- Story Code：${story.storyCode || "（无）"}`,
+    `- Story Type：${story.storyType || "（无）"}`,
+    `- Story Brief：${story.storyBrief || "（无）"}`,
+    `- Story Important Info：${story.storyImportantInfo || "（无）"}`,
+    "",
+    "项目 Memory：",
+    memoryText,
+    "",
+    "项目经验 / 教训：",
+    lessonText,
+    "",
+    "执行规则：",
+    "1. 当前工作目录就是项目根目录，你要对真实项目代码进行分析与开发，不是只给建议。",
+    `2. 你必须使用当前已注入的 sysbuilder MCP，在开始正式执行本 Story 时立即调用 update_story_status，把 projectId='${story.projectId || ""}'、storyId='${story.storyId}' 的状态设为 IN_PROGRESS。`,
+    `3. 当你确认该 Story 的开发已经完成时，必须在结束前再次调用 update_story_status，把 projectId='${story.projectId || ""}'、storyId='${story.storyId}' 的状态设为 DONE。`,
+    "4. 本任务采用 plan-first：第一轮必须先完成代码阅读和实现范围确认，并先向用户给出开发计划，再等待确认后继续开发。",
+    "5. 第一轮如果没有阻塞性歧义，也不要直接开始改代码；而是必须按 NEED_USER_INPUT 协议发起一个“是否按该计划开始开发”的确认。",
+    "6. 计划至少要包含：准备修改的模块/文件、核心改动点、可能风险、预计输出结果。",
+    "7. 用户确认后，再进入实际开发；开发过程中如果出现新的关键歧义，继续按 NEED_USER_INPUT 协议提问。",
+    "8. 如果需求已经明确，确认后应直接在当前项目里实施改动，尽量完成端到端闭环，而不是停留在分析层。",
+    "9. 不要启动新的 bridge / MCP / 本地服务副本；使用当前环境已有能力。",
+    "10. 全程使用中文。",
+    "11. 每次正式开始执行前，都必须先阅读并遵守上面的项目 Memory 与项目经验 / 教训。",
+    "12. 如果执行过程中发现了值得长期保留的项目事实、踩坑、约束、经验或教训，请在当轮回复中附带一个或多个 AUTO_DEV_MEMORY 块，我会自动保存到项目知识中。",
+    "",
+    "NEED_USER_INPUT 协议格式如下：",
+    "<<<NEED_USER_INPUT>>>",
+    "question: [要问用户的问题，第一轮应是是否按该开发计划开始]",
+    "context: [你的当前理解、计划摘要、涉及文件、风险、为什么需要确认]",
+    "kind: [auto-dev]",
+    "suggested_options:",
+    "- [选项1]",
+    "- [选项2]",
+    "<<<END_NEED_USER_INPUT>>>",
+    "",
+    "AUTO_DEV_MEMORY 协议格式如下：",
+    "<<<AUTO_DEV_MEMORY>>>",
+    "type: [memory 或 lesson]",
+    "title: [简短标题]",
+    "content:",
+    "[需要长期保存的完整内容]",
+    "<<<END_AUTO_DEV_MEMORY>>>",
+    "",
+    "完成时请给出中文结果总结，至少包含：",
+    "- 是否已完成开发",
+    "- 改动了哪些文件",
+    "- 解决了哪些目标",
+    "- 是否还有剩余阻塞或待确认项",
+  ].join("\n");
+}
+
+function buildAutoDevPrompt(projectPath, story, promptOverride) {
+  const override = normalizePromptOverride(promptOverride);
+  const { memoryText, lessonText } = buildAutoDevKnowledgeSections(projectPath);
+  if (!override) return buildDefaultAutoDevPrompt(projectPath, story);
+  return renderPromptTemplate(override, {
+    projectPath,
+    projectId: story.projectId || "",
+    storyId: story.storyId || "",
+    storyCode: story.storyCode || "",
+    storyType: story.storyType || "",
+    storyBrief: story.storyBrief || "",
+    storyImportantInfo: story.storyImportantInfo || "",
+    projectMemories: memoryText,
+    projectLessons: lessonText,
+  });
+}
+
 function getAnalysisOutputPaths(localPath) {
   const outputDir = join(localPath, "sysbuilder", "project-analysis");
   return {
@@ -1164,6 +1637,10 @@ function buildAnalysisPrompt(localPath, reportId, promptOverride) {
 
 function isJobStopRequested(jobId) {
   return Boolean(analysisJobs.get(jobId)?.stopRequested);
+}
+
+function isJobTerminalStatus(status) {
+  return status === "completed" || status === "failed" || status === "cancelled";
 }
 
 function detectUnresolvedConfirmations(text) {
@@ -1227,15 +1704,41 @@ function listRefactorMarkdown(projectPath) {
     .sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
-function buildStoryMapSyncCompletionSummary(job, replyText) {
+async function buildStoryMapSyncCompletionSummary(job, replyText) {
   const fullReply = String(replyText || "").replace(/\r\n/g, "\n").trim();
 
   return [
     "✅ Story Map 同步已完成",
     `项目目录：${job.projectPath}`,
-    job.projectId ? `项目 ID：${job.projectId}` : null,
+    ...await buildProjectIdentityLines(job.projectPath, job.projectId),
     fullReply ? "模型回复：" : null,
     fullReply || "（模型未返回正文）",
+  ].filter(Boolean).join("\n");
+}
+
+async function buildAutoDevCompletionSummary(job, replyText) {
+  const fullReply = String(replyText || "").replace(/\r\n/g, "\n").trim();
+
+  return [
+    "🤖 AutoCoder 自动开发已完成",
+    `项目目录：${job.projectPath}`,
+    ...await buildProjectIdentityLines(job.projectPath, job.projectId),
+    job.storyCode ? `Story Code：${job.storyCode}` : null,
+    job.storyBrief ? `Story Brief：${job.storyBrief}` : null,
+    fullReply ? "模型回复：" : null,
+    fullReply || "（模型未返回正文）",
+  ].filter(Boolean).join("\n");
+}
+
+async function buildAutoDevCancelSummary(job, rollbackSummary) {
+  return [
+    "⏹️ AutoCoder 自动开发已取消",
+    `项目目录：${job.projectPath}`,
+    ...await buildProjectIdentityLines(job.projectPath, job.projectId),
+    job.storyCode ? `Story Code：${job.storyCode}` : null,
+    job.storyBrief ? `Story Brief：${job.storyBrief}` : null,
+    "本次会话已由客户端手动停止。",
+    rollbackSummary || null,
   ].filter(Boolean).join("\n");
 }
 
@@ -1562,7 +2065,7 @@ async function processStoryMapSyncReply(job, replyText) {
     latestReplyPreview: replyText.slice(0, 500),
     error: null,
   });
-  notifyLark(buildStoryMapSyncCompletionSummary(job, replyText), job.notifyChatId);
+  notifyLark(await buildStoryMapSyncCompletionSummary(job, replyText), job.notifyChatId);
   try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
 }
 
@@ -1593,6 +2096,151 @@ async function continueStoryMapSync(job, prompt) {
     return;
   }
   await processStoryMapSyncReply(job, replyText);
+}
+
+async function processAutoDevReply(job, replyText) {
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`自动开发任务 ${job.jobId} 已被 stop，请忽略本轮 Session B 回复`);
+    return;
+  }
+
+  const capturedMemories = extractAutoDevMemoryBlocks(replyText);
+  for (const entry of capturedMemories) {
+    upsertProjectAutoDevMemory(job.projectPath, {
+      ...entry,
+      source: "auto",
+      storyId: job.storyId,
+      storyCode: job.storyCode,
+      jobId: job.jobId,
+    });
+  }
+
+  const followUp = parseNeedUserInput(replyText);
+  if (followUp) {
+    const ticketId = nextTicketId();
+    const ticket = {
+      ticketId,
+      jobId: job.jobId,
+      jobKind: job.kind,
+      chatId: job.notifyChatId,
+      sessionId: job.sessionId,
+      questionText: followUp.question,
+      context: followUp.context,
+      kind: followUp.kind,
+      options: followUp.options,
+      status: "waiting",
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+    };
+    waitingTickets.set(ticketId, ticket);
+    updateJob(job.jobId, {
+      status: "waiting_user",
+      waitingTicketId: ticketId,
+      latestQuestion: ticket.questionText,
+      latestQuestionContext: ticket.context,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    sendQuestionToLark(ticket);
+    return;
+  }
+
+  const fatalExecutionError = detectFatalExecutionError(replyText);
+  if (fatalExecutionError) {
+    updateJob(job.jobId, {
+      status: "failed",
+      error: fatalExecutionError,
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark(`❌ AutoCoder 自动开发失败：${fatalExecutionError}`, job.notifyChatId);
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  const unresolvedConfirmations = detectUnresolvedConfirmations(replyText);
+  if (unresolvedConfirmations) {
+    const nextRetryCount = (job.unresolvedRetryCount || 0) + 1;
+    updateJob(job.jobId, {
+      status: "running",
+      unresolvedRetryCount: nextRetryCount,
+      latestReplyPreview: replyText.slice(0, 500),
+      error: null,
+    });
+
+    if (nextRetryCount <= 2) {
+      const retryPrompt = [
+        "你刚才的 AutoCoder 回复里仍然包含未确认事项，但没有按 NEED_USER_INPUT 协议正式发起确认，因此现在不能直接结束自动开发。",
+        `检测到的未确认内容：${unresolvedConfirmations}`,
+        "",
+        "请按以下规则继续：",
+        "1. 如果这些事项需要用户确认，请立即只输出一个 NEED_USER_INPUT 块，先询问当前最关键的一项。",
+        "2. 不要在同一轮里一边提问、一边继续宣布开发完成。",
+        "3. 只有在确实无需进一步确认时，才明确说明“无需用户确认，可继续完成”，并去掉“仍待确认/剩余问题/待确认事项”等表述。",
+      ].join("\n");
+      await continueAutoDev(analysisJobs.get(job.jobId), retryPrompt);
+      return;
+    }
+
+    updateJob(job.jobId, {
+      status: "failed",
+      error: "AutoCoder 输出仍包含未确认事项，但未按 NEED_USER_INPUT 协议发起提问",
+      latestReplyPreview: replyText.slice(0, 500),
+    });
+    notifyLark("❌ AutoCoder 未能正确处理待确认事项：仍有未确认内容，但没有按 NEED_USER_INPUT 协议发起提问。", job.notifyChatId);
+    try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+    return;
+  }
+
+  updateJob(job.jobId, {
+    status: "completed",
+    latestReplyPreview: replyText.slice(0, 500),
+    error: null,
+  });
+  try {
+    await syncStoryStatusByBridge(job.projectId, job.storyId, "DONE", { jobId: job.jobId });
+  } catch (err) {
+    const message = err?.message || String(err);
+    log.warn(`AutoCoder 完成后同步 DONE 失败：${message}`);
+    appendJobLiveLog(job.jobId, `\n[Bridge] 同步 Story DONE 失败：${message}\n`);
+  }
+  notifyLark(await buildAutoDevCompletionSummary(job, replyText), job.notifyChatId);
+  try { await job.connection.closeSession({ sessionId: job.sessionId }); } catch {}
+}
+
+async function continueAutoDev(job, prompt) {
+  if (!job || isJobStopRequested(job.jobId)) return;
+  const roundHeader = [
+    "",
+    `===== [${new Date().toLocaleTimeString("zh-CN", { hour12: false })}] USER =====`,
+    prompt,
+    "",
+    "===== ASSISTANT =====",
+    "",
+  ].join("\n");
+  updateJob(job.jobId, {
+    status: "running",
+    liveLog: `${job.liveLog || ""}${roundHeader}`,
+  });
+  let replyText = "";
+  try {
+    replyText = await sendToACP(
+      job.connection,
+      job.client,
+      job.sessionId,
+      prompt,
+      (chunk) => appendJobLiveLog(job.jobId, chunk),
+    );
+  } catch (err) {
+    if (isJobStopRequested(job.jobId)) {
+      log.info(`自动开发任务 ${job.jobId} 在 sendToACP 期间已被 stop，终止后续处理`);
+      return;
+    }
+    throw err;
+  }
+  if (isJobStopRequested(job.jobId)) {
+    log.info(`自动开发任务 ${job.jobId} 在收到回复后已被 stop，终止后续处理`);
+    return;
+  }
+  await processAutoDevReply(job, replyText);
 }
 
 async function startRefactorAnalysis(projectPath, options = {}) {
@@ -1640,7 +2288,9 @@ async function startRefactorAnalysis(projectPath, options = {}) {
       }
     }
 
-    const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [] });
+    const configuredSysbuilderServer = requireConfiguredSysbuilderMcpServer();
+    const sysbuilderServer = buildAcpMcpServer(configuredSysbuilderServer);
+    const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [sysbuilderServer] });
     updateJob(jobId, {
       status: "running",
       connection: conn2,
@@ -1648,6 +2298,13 @@ async function startRefactorAnalysis(projectPath, options = {}) {
       socket: socket2,
       sessionId,
     });
+    try {
+      await syncStoryStatusByBridge(story.projectId, story.storyId, "IN_PROGRESS", { jobId });
+    } catch (err) {
+      const message = err?.message || String(err);
+      log.warn(`AutoCoder 启动后同步 IN_PROGRESS 失败：${message}`);
+      appendJobLiveLog(jobId, `\n[Bridge] 同步 Story IN_PROGRESS 失败：${message}\n`);
+    }
     if (isJobStopRequested(jobId)) {
       try { await conn2.cancel({ sessionId }); } catch {}
       try { await conn2.closeSession({ sessionId }); } catch {}
@@ -1755,7 +2412,7 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
     notifyLark([
       "🗺️ 已开始 Story Map 同步。",
       `项目目录：${projectPath}`,
-      projectId ? `项目 ID：${projectId}` : null,
+      ...await buildProjectIdentityLines(projectPath, projectId),
       "接下来将读取 sysbuilder/refactor/ 迭代文档、调用 sysbuilder MCP 读取现有 Story Map，并把明确全新的项补入 Story Map。",
       "如果过程中存在相近但无法自动判定的项，我会继续在群里提问确认。",
     ].filter(Boolean).join("\n"), notifyChatId);
@@ -1774,14 +2431,133 @@ async function startStoryMapSync(projectPath, projectId, options = {}) {
   return jobId;
 }
 
-function findTicketForAnswer(msgText) {
+async function startAutoDev(projectPath, story, options = {}) {
+  const jobId = `auto-dev-${Date.now()}`;
+  const routeKey = buildChatRouteKey(options.userId, story.projectId);
+  const notifyChatId = resolveTaskChat(routeKey);
+  if (!notifyChatId) {
+    throw new Error("当前没有可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID");
+  }
+
+  const activeJob = Array.from(analysisJobs.values())
+    .filter((job) => job.kind === "auto-dev" && job.projectPath === projectPath)
+    .find((job) => !isJobTerminalStatus(job.status));
+  if (activeJob) {
+    if (activeJob.storyId === story.storyId) {
+      return { jobId: activeJob.jobId, reused: true, status: activeJob.status };
+    }
+    const error = new Error(`项目 ${projectPath} 已有进行中的 AutoCoder 会话 ${activeJob.jobId}（storyId=${activeJob.storyId || "unknown"}）`);
+    error.code = "AUTO_DEV_ACTIVE_JOB";
+    error.jobId = activeJob.jobId;
+    error.status = activeJob.status;
+    error.storyId = activeJob.storyId || "";
+    error.storyBrief = activeJob.storyBrief || "";
+    throw error;
+  }
+
+  const job = {
+    kind: "auto-dev",
+    jobId,
+    projectId: story.projectId,
+    projectPath,
+    storyId: story.storyId,
+    storyCode: story.storyCode,
+    storyBrief: story.storyBrief,
+    storyType: story.storyType,
+    storyImportantInfo: story.storyImportantInfo,
+    status: "starting",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+    latestReplyPreview: null,
+    liveLog: "",
+    unresolvedRetryCount: 0,
+    notifyChatId,
+    routeKey,
+    stopRequested: false,
+    error: null,
+    connection: null,
+    client: null,
+    socket: null,
+    sessionId: null,
+  };
+  analysisJobs.set(jobId, job);
+
+  try {
+    let conn2, client2, socket2;
+    for (let i = 1; i <= CONFIG.maxRetries; i++) {
+      try { ({ connection: conn2, client: client2, socket: socket2 } = await connectToACP()); break; }
+      catch (err) {
+        if (i === CONFIG.maxRetries) throw new Error(`AutoCoder 会话连接失败：${err.message}`);
+        await sleep(2000);
+      }
+    }
+
+    const { sessionId } = await conn2.newSession({ cwd: projectPath, mcpServers: [] });
+    updateJob(jobId, {
+      status: "running",
+      connection: conn2,
+      client: client2,
+      socket: socket2,
+      sessionId,
+    });
+    if (isJobStopRequested(jobId)) {
+      try { await conn2.cancel({ sessionId }); } catch {}
+      try { await conn2.closeSession({ sessionId }); } catch {}
+      destroyJobTransport({ socket: socket2 });
+      return { jobId, reused: false };
+    }
+
+    notifyLark([
+      "🤖 已开始 AutoCoder 自动开发。",
+      `项目目录：${projectPath}`,
+      ...await buildProjectIdentityLines(projectPath, story.projectId),
+      story.storyCode ? `Story Code：${story.storyCode}` : null,
+      story.storyBrief ? `Story Brief：${story.storyBrief}` : null,
+      "第一轮会先输出开发计划并等待确认；如果有疑问，我也会继续在群里提问。",
+    ].filter(Boolean).join("\n"), notifyChatId);
+
+    const prompt = buildAutoDevPrompt(projectPath, story, options.promptOverride);
+
+    continueAutoDev(analysisJobs.get(jobId), prompt).catch((err) => {
+      updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+      notifyLark(`❌ AutoCoder 自动开发失败：${err?.message || String(err)}`, notifyChatId);
+    });
+  } catch (err) {
+    updateJob(jobId, { status: "failed", error: err?.message || String(err) });
+    notifyLark(`❌ AutoCoder 自动开发启动失败：${err?.message || String(err)}`, notifyChatId);
+  }
+
+  return { jobId, reused: false };
+}
+
+function findTicketForAnswer(msgText, event = null) {
   if (!msgText || msgText.startsWith("!")) return null;
+  const replyMessageIds = extractReplyMessageIds(event);
+  if (replyMessageIds.length) {
+    const matchedByReply = Array.from(waitingTickets.values()).filter((ticket) => (
+      isTicketWaiting(ticket)
+      && ticket.messageIds?.some((messageId) => replyMessageIds.includes(messageId))
+      && (!event?.chat_id || !ticket.chatId || ticket.chatId === event.chat_id)
+    ));
+    if (matchedByReply.length === 1) {
+      return matchedByReply[0];
+    }
+  }
   const explicitId = msgText.match(/\[(Q-\d{8}-\d{3})\]/)?.[1];
-  if (explicitId && waitingTickets.has(explicitId)) {
+  if (explicitId && isTicketWaiting(waitingTickets.get(explicitId))) {
     return waitingTickets.get(explicitId);
   }
 
-  const waiting = Array.from(waitingTickets.values()).filter((ticket) => ticket.status === "waiting");
+  const waiting = Array.from(waitingTickets.values()).filter((ticket) => isTicketWaiting(ticket));
+  if (event?.chat_id) {
+    const waitingInChat = waiting.filter((ticket) => !ticket.chatId || ticket.chatId === event.chat_id);
+    if (waitingInChat.length === 1) {
+      return waitingInChat[0];
+    }
+  }
   if (waiting.length === 1) {
     return waiting[0];
   }
@@ -1850,6 +2626,38 @@ async function resumeStoryMapSync(ticket, answerText) {
   await continueStoryMapSync(job, resumePrompt);
 }
 
+async function resumeAutoDev(ticket, answerText) {
+  const job = analysisJobs.get(ticket.jobId);
+  if (!job || !job.connection || !job.sessionId) {
+    throw new Error("找不到对应的 AutoCoder 会话，无法继续");
+  }
+
+  const normalizedAnswerText = normalizeTicketAnswerText(answerText, ticket.ticketId);
+  waitingTickets.set(ticket.ticketId, { ...ticket, status: "answered", answerText: normalizedAnswerText });
+  updateJob(job.jobId, {
+    status: "running",
+    stopRequested: false,
+    waitingTicketId: null,
+    latestQuestion: null,
+    latestQuestionContext: null,
+  });
+
+  const resumePrompt = [
+    "继续刚才的 AutoCoder 自动开发任务。",
+    "",
+    "你之前提出的问题是：",
+    ticket.questionText,
+    "",
+    "用户的回答是：",
+    normalizedAnswerText,
+    "",
+    "请基于该回答继续开发当前 Story。",
+    "如果还有疑问，请继续按 NEED_USER_INPUT 协议输出。",
+  ].join("\n");
+
+  await continueAutoDev(job, resumePrompt);
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -1909,6 +2717,44 @@ function createHttpServer() {
         return sendJson(res, 200, { jobId });
       }
 
+      if (req.method === "POST" && url.pathname === "/auto-dev/start") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const storyId = typeof body.storyId === "string" ? body.storyId.trim() : "";
+        const storyBrief = typeof body.storyBrief === "string" ? body.storyBrief.trim() : "";
+        const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+        const promptOverride = normalizePromptOverride(body.promptOverride);
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (!storyId) return sendJson(res, 400, { error: "storyId is required" });
+        if (!storyBrief) return sendJson(res, 400, { error: "storyBrief is required" });
+        if (!resolveTaskChat(buildChatRouteKey(userId, projectId))) {
+          return sendJson(res, 400, { error: "尚无可用的飞书 chat 路由，请先在目标群里和 Bot 说一句话建立绑定，或显式配置 LARK_CHAT_ID" });
+        }
+        try {
+          const result = await startAutoDev(projectPath, {
+            projectId,
+            storyId,
+            storyCode: typeof body.storyCode === "string" ? body.storyCode.trim() : "",
+            storyType: typeof body.storyType === "string" ? body.storyType.trim() : "",
+            storyBrief,
+            storyImportantInfo: typeof body.storyImportantInfo === "string" ? body.storyImportantInfo.trim() : "",
+          }, { userId, promptOverride });
+          return sendJson(res, 200, result);
+        } catch (err) {
+          if (err?.code === "AUTO_DEV_ACTIVE_JOB") {
+            return sendJson(res, 409, {
+              error: err.message,
+              jobId: err.jobId,
+              status: err.status,
+              storyId: err.storyId,
+              storyBrief: err.storyBrief,
+            });
+          }
+          throw err;
+        }
+      }
+
       if (req.method === "GET" && url.pathname === "/refactor-analysis/find") {
         const projectPath = url.searchParams.get("projectPath")?.trim();
         if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
@@ -1931,6 +2777,72 @@ function createHttpServer() {
         return sendJson(res, 200, { jobId: activeJob.jobId, status: activeJob.status });
       }
 
+      if (req.method === "GET" && url.pathname === "/auto-dev/find") {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        const matches = Array.from(analysisJobs.values())
+          .filter((job) => job.kind === "auto-dev" && job.projectPath === projectPath)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        const activeJob = matches.find((job) => !isJobTerminalStatus(job.status)) || matches[0];
+        if (!activeJob) return sendJson(res, 404, { error: "job not found" });
+        return sendJson(res, 200, { jobId: activeJob.jobId, status: activeJob.status });
+      }
+
+      if (req.method === "GET" && url.pathname === "/auto-dev/list") {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        const jobs = Array.from(analysisJobs.values())
+          .filter((job) => job.kind === "auto-dev" && job.projectPath === projectPath)
+          .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+          .map((job) => {
+            const publicJob = { ...job };
+            delete publicJob.connection;
+            delete publicJob.client;
+            delete publicJob.socket;
+            return publicJob;
+          });
+        return sendJson(res, 200, { jobs });
+      }
+
+      if (req.method === "GET" && url.pathname === "/auto-dev/memories") {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        return sendJson(res, 200, { entries: listProjectAutoDevMemories(projectPath) });
+      }
+
+      if (req.method === "POST" && url.pathname === "/auto-dev/memories") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const type = typeof body.type === "string" ? body.type.trim() : "";
+        const title = typeof body.title === "string" ? body.title.trim() : "";
+        const content = typeof body.content === "string" ? body.content.trim() : "";
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (!normalizeAutoDevMemoryType(type)) return sendJson(res, 400, { error: "type must be memory or lesson" });
+        if (!content) return sendJson(res, 400, { error: "content is required" });
+        const entry = upsertProjectAutoDevMemory(projectPath, { type, title, content, source: "manual" });
+        return sendJson(res, 200, { entry });
+      }
+
+      if (req.method === "POST" && url.pathname === "/auto-dev/memories/delete") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const entryId = typeof body.entryId === "string" ? body.entryId.trim() : "";
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (!entryId) return sendJson(res, 400, { error: "entryId is required" });
+        const result = deleteProjectAutoDevMemory(projectPath, entryId);
+        if (!result.deleted) return sendJson(res, 404, { error: "memory entry not found" });
+        return sendJson(res, 200, result);
+      }
+
+      if (req.method === "POST" && url.pathname === "/auto-dev/memories/clear") {
+        const body = await readJsonBody(req);
+        const projectPath = typeof body.projectPath === "string" ? body.projectPath.trim() : "";
+        const type = typeof body.type === "string" ? body.type.trim() : "";
+        if (!projectPath) return sendJson(res, 400, { error: "projectPath is required" });
+        if (type && !normalizeAutoDevMemoryType(type)) return sendJson(res, 400, { error: "type must be memory or lesson" });
+        return sendJson(res, 200, clearProjectAutoDevMemories(projectPath, type || null));
+      }
+
       if (req.method === "GET" && url.pathname === "/refactor-analysis/status") {
         const jobId = url.searchParams.get("jobId");
         if (!jobId || !analysisJobs.has(jobId)) return sendJson(res, 404, { error: "job not found" });
@@ -1949,6 +2861,96 @@ function createHttpServer() {
         delete publicJob.connection;
         delete publicJob.client;
         return sendJson(res, 200, publicJob);
+      }
+
+      if (req.method === "GET" && url.pathname === "/auto-dev/status") {
+        const jobId = url.searchParams.get("jobId");
+        if (!jobId || !analysisJobs.has(jobId)) return sendJson(res, 404, { error: "job not found" });
+        const job = analysisJobs.get(jobId);
+        const publicJob = { ...job };
+        delete publicJob.connection;
+        delete publicJob.client;
+        delete publicJob.socket;
+        return sendJson(res, 200, publicJob);
+      }
+
+      if (req.method === "POST" && url.pathname === "/auto-dev/reply") {
+        const body = await readJsonBody(req);
+        const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
+        const waitingTicketId = typeof body.waitingTicketId === "string" ? body.waitingTicketId.trim() : "";
+        const answerText = typeof body.answerText === "string" ? body.answerText.trim() : "";
+        if (!jobId) return sendJson(res, 400, { error: "jobId is required" });
+        if (!answerText) return sendJson(res, 400, { error: "answerText is required" });
+        const job = analysisJobs.get(jobId);
+        if (!job) return sendJson(res, 404, { error: "job not found" });
+        if (job.kind !== "auto-dev") return sendJson(res, 400, { error: "job is not auto-dev" });
+      if (waitingTicketId && waitingTicketId !== job.waitingTicketId) {
+          return sendJson(res, 409, { error: "等待中的问题已变化，请刷新后重试", waitingTicketId: job.waitingTicketId || null });
+        }
+        if (!job.waitingTicketId || !isTicketWaiting(waitingTickets.get(job.waitingTicketId))) {
+          return sendJson(res, 400, { error: "当前会话没有等待中的问题" });
+        }
+        const ticket = waitingTickets.get(job.waitingTicketId);
+        notifyLark([
+          `💬 已有用户在客户端回复该问题。`,
+          `问题 ID：${ticket.ticketId}`,
+          "内容：",
+          answerText,
+        ].join("\n"), job.notifyChatId);
+        await resumeAutoDev(ticket, answerText);
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (req.method === "POST" && url.pathname === "/auto-dev/cancel") {
+        const body = await readJsonBody(req);
+        const jobId = typeof body.jobId === "string" ? body.jobId.trim() : "";
+        if (!jobId) return sendJson(res, 400, { error: "jobId is required" });
+        const job = analysisJobs.get(jobId);
+        if (!job || job.kind !== "auto-dev") return sendJson(res, 404, { error: "job not found" });
+        if (job.waitingTicketId && waitingTickets.has(job.waitingTicketId)) {
+          waitingTickets.set(job.waitingTicketId, {
+            ...waitingTickets.get(job.waitingTicketId),
+            status: "cancelled",
+            cancelledAt: new Date().toISOString(),
+          });
+        }
+        updateJob(jobId, {
+          stopRequested: true,
+          waitingTicketId: null,
+          latestQuestion: null,
+          latestQuestionContext: null,
+          error: "已由用户取消 AutoCoder 自动开发",
+        });
+        try { await job.connection?.cancel({ sessionId: job.sessionId }); } catch {}
+        appendJobLiveLog(jobId, `\n[Bridge] 已停止当前动作，开始让 AutoCoder 本地撤销本次会话改动...\n`);
+        let rollbackResult;
+        try {
+          rollbackResult = await undoAutoDevChangesByCoder(job);
+        } catch (err) {
+          rollbackResult = {
+            applied: false,
+            summary: `AutoCoder 本地撤销失败：${err?.message || String(err)}`,
+          };
+        }
+        appendJobLiveLog(jobId, `\n[Bridge] ${rollbackResult.summary}\n`);
+        try {
+          await syncStoryStatusByBridge(job.projectId, job.storyId, "TODO", { jobId });
+        } catch (err) {
+          const message = err?.message || String(err);
+          log.warn(`AutoCoder 取消后同步 TODO 失败：${message}`);
+          appendJobLiveLog(jobId, `\n[Bridge] 同步 Story TODO 失败：${message}\n`);
+        }
+        updateJob(jobId, {
+          status: "cancelled",
+          latestReplyPreview: rollbackResult.summary,
+          connection: null,
+          client: null,
+          socket: null,
+        });
+        try { await job.connection?.closeSession({ sessionId: job.sessionId }); } catch {}
+        destroyJobTransport(job);
+        notifyLark(await buildAutoDevCancelSummary(job, rollbackResult.summary), job.notifyChatId);
+        return sendJson(res, 200, { stopped: true, status: "cancelled", rollback: rollbackResult });
       }
 
       if (req.method === "POST" && url.pathname === "/report-analysis/cancel") {
@@ -2339,16 +3341,19 @@ async function main() {
       if (senderRouteKey) persistChatRoute(senderRouteKey, lastChatId);
     }
 
-    const matchedTicket = findTicketForAnswer(msgText);
+    const matchedTicket = findTicketForAnswer(msgText, event);
     if (matchedTicket) {
       queue.enqueue(async () => {
         log.info(`收到问题 ${matchedTicket.ticketId} 的用户答复，准备恢复分析...`);
+        const normalizedAnswerText = normalizeTicketAnswerText(msgText, matchedTicket.ticketId);
         try {
           notifyLark(`✅ 已收到 [${matchedTicket.ticketId}] 的答复，继续处理中...`, matchedTicket.chatId);
           if (matchedTicket.jobKind === "storymap-sync") {
-            await resumeStoryMapSync(matchedTicket, msgText);
+            await resumeStoryMapSync(matchedTicket, normalizedAnswerText);
+          } else if (matchedTicket.jobKind === "auto-dev") {
+            await resumeAutoDev(matchedTicket, normalizedAnswerText);
           } else {
-            await resumeRefactorAnalysis(matchedTicket, msgText);
+            await resumeRefactorAnalysis(matchedTicket, normalizedAnswerText);
           }
         } catch (err) {
           log.error(`恢复分析失败：${err.message}`);
