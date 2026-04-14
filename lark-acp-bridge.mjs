@@ -1643,6 +1643,10 @@ function isJobTerminalStatus(status) {
   return status === "completed" || status === "failed" || status === "cancelled";
 }
 
+function getRunningJobCount() {
+  return Array.from(analysisJobs.values()).filter((job) => !isJobTerminalStatus(job.status)).length;
+}
+
 function detectUnresolvedConfirmations(text) {
   if (!text) return null;
   const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -2685,7 +2689,7 @@ function createHttpServer() {
       const url = new URL(req.url || "/", `http://127.0.0.1:${CONFIG.bridgeHttpPort}`);
 
       if (req.method === "GET" && url.pathname === "/health") {
-        return sendJson(res, 200, { ok: true, lastChatId, runningJobs: analysisJobs.size });
+        return sendJson(res, 200, { ok: true, lastChatId, runningJobs: getRunningJobCount() });
       }
 
       if (req.method === "POST" && url.pathname === "/refactor-analysis/start") {
@@ -2783,7 +2787,7 @@ function createHttpServer() {
         const matches = Array.from(analysisJobs.values())
           .filter((job) => job.kind === "auto-dev" && job.projectPath === projectPath)
           .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-        const activeJob = matches.find((job) => !isJobTerminalStatus(job.status)) || matches[0];
+        const activeJob = matches.find((job) => !isJobTerminalStatus(job.status));
         if (!activeJob) return sendJson(res, 404, { error: "job not found" });
         return sendJson(res, 200, { jobId: activeJob.jobId, status: activeJob.status });
       }

@@ -158,9 +158,8 @@ node -e "import('@agentclientprotocol/sdk').then(()=>console.log('OK'))"
 4. 将模板内容粘贴进去
 5. 替换占位符：
    - `YOUR_NAME` → 你的名字
-   - `YOUR_CWD` → 默认工作目录路径
 
-然后启动时，`launch.sh` 会自动同步到 `{cwd}/AGENTS.md`。
+工作目录不要写进 Agent 模板。启动时由 `launch.sh` 交互询问，或通过 `--cwd` 传入；随后 `launch.sh` 会自动同步到 `{cwd}/AGENTS.md`。
 
 ---
 

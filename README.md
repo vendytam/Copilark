@@ -53,7 +53,7 @@ Agent 文件结构：
 
 修改角色：直接编辑 `~/.copilot/agents/dawbolong.agent.md`，重启 ACP Server 后生效。
 
-项目内 `agents/dawbolong.agent.md` 是通用模板（占位符版本），可作为新机器初始化时的参考。
+项目内 `agents/dawbolong.agent.md` 是通用模板（占位符版本），可作为新机器初始化时的参考；工作目录不写在模板里，启动时交互选择或通过 `--cwd` 传入。
 
 ## 依赖
 

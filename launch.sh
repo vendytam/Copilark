@@ -120,16 +120,7 @@ ACP_FLAGS="${ACP_FLAGS# }"
 if [ -z "$BRIDGE_CWD" ]; then
   echo ""
   echo "[ 工作目录 ]"
-  # 读取 agent 文件里的默认工作目录（defaultWorkDir 或 WorkSpaceClaw 等）
-  DEFAULT_CWD="$USERPROFILE/WorkSpaceClaw"
-  # 尝试从 agent 文件提取默认工作目录
-  AGENT_FILE="$USERPROFILE/.copilot/agents/${SELECTED_AGENT}.agent.md"
-  if [ -f "$AGENT_FILE" ]; then
-    extracted=$(grep -m1 '默认工作目录' "$AGENT_FILE" | grep -oP '(?<=：)[^\s]+' | head -1)
-    [ -n "$extracted" ] && DEFAULT_CWD="$extracted"
-  fi
-  # 转为 Unix 路径
-  DEFAULT_CWD_UNIX="$(cygpath -u "$DEFAULT_CWD" 2>/dev/null || echo "$DEFAULT_CWD")"
+  DEFAULT_CWD="${COPILARK_DEFAULT_CWD:-$USERPROFILE/WorkSpaceClaw}"
   echo "  默认：$DEFAULT_CWD"
   echo ""
   read -e -r -p "  输入工作目录（直接回车使用默认）: " input_cwd
